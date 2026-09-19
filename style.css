@@ -1,0 +1,160 @@
+.jev-lorebook-settings .inline-drawer-content {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.jev-lorebook-settings label {
+    margin-top: 4px;
+}
+
+.jev-lorebook-status {
+    opacity: 0.7;
+    min-height: 1em;
+}
+
+/* ── 세부 패널 (요술봉) ─────────────────────────────────────────────── */
+
+.jev-lorebook-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    text-align: left;
+}
+
+.jev-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.jev-panel-header h3 {
+    margin: 0;
+}
+
+.jev-panel-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-top: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+    padding-top: 8px;
+}
+
+.jev-panel-title {
+    font-weight: bold;
+}
+
+.jev-panel-row {
+    display: flex;
+    gap: 8px;
+}
+
+.jev-panel-label {
+    opacity: 0.7;
+    min-width: 7em;
+}
+
+.jev-panel-muted {
+    opacity: 0.7;
+    font-size: 0.9em;
+}
+
+.jev-panel-error {
+    color: var(--warning, #e5a50a);
+    font-size: 0.9em;
+}
+
+.jev-panel-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85em;
+}
+
+.jev-panel-table th,
+.jev-panel-table td {
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+    padding: 2px 6px;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.jev-panel-table td.jev-cell-title {
+    white-space: normal;
+    word-break: break-all;
+}
+
+.jev-panel-table tr.jev-adopted {
+    background-color: rgba(80, 160, 80, 0.18);
+    font-weight: bold;
+}
+
+.jev-panel-table tr.jev-missing {
+    opacity: 0.6;
+}
+
+.jev-panel-world {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.jev-panel-world-title {
+    font-weight: bold;
+    font-size: 0.9em;
+}
+
+.jev-panel-core {
+    border: 1px solid rgba(230, 180, 60, 0.5);
+    border-radius: 4px;
+    padding: 4px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background-color: rgba(230, 180, 60, 0.08);
+}
+
+.jev-panel-core-title {
+    font-weight: bold;
+    font-size: 0.9em;
+}
+
+/* ── 스플릿 선택 다이얼로그 ─────────────────────────────────── */
+
+.jev-split-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    text-align: left;
+}
+
+.jev-split-dialog h3 {
+    margin: 0 0 4px 0;
+}
+
+.jev-split-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+}
+
+.jev-split-row .jev-cell-title {
+    flex: 1;
+}
+
+.jev-reindex-warning {
+    color: var(--warning, #e5a50a);
+    font-size: 0.9em;
+}
+
+.jev-key-missing {
+    color: var(--warning, #e5a50a);
+}
+
+.jev-profile-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}

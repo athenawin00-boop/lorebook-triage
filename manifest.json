@@ -1,0 +1,12 @@
+{
+    "display_name": "Jev Lorebook",
+    "loading_order": 200,
+    "requires": [],
+    "optional": [],
+    "generate_interceptor": "jevLorebookInterceptor",
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Hyeon",
+    "version": "0.5.1",
+    "homePage": ""
+}
