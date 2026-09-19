@@ -1,5 +1,5 @@
 /**
- * Jev Lorebook — 로어북 장기기억을 벡터 검색 + Jev 3축 판정으로 주입하는 확장 (v0.3, A안 배관)
+ * Lorebook Triage — 로어북 장기기억을 벡터 검색 + Jev 3축 판정으로 주입하는 확장 (v0.3, A안 배관)
  *
  * 흐름 (매 생성, generate_interceptor):
  *   최근 유저 메시지 → /api/vector/query (palm=Gemini) → 후보 topK
@@ -26,8 +26,8 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 import { hideChatMessageRange } from '../../../chats.js';
 
 const MODULE = 'jevLorebook';
-const TEMPLATE_PATH = 'third-party/jev-lorebook';
-const LOG = '[Jev Lorebook]';
+const TEMPLATE_PATH = 'third-party/lorebook-triage';
+const LOG = '[Lorebook Triage]';
 
 // api.typesafe.ai는 브라우저 오리진을 CORS로 거부한다 → 서버 경유 필수. 전송 경로 2개를 자동 감지한다 (v0.4.1):
 // 1순위 — jev-proxy 서버 플러그인: 키는 X-Jev-Key 헤더 (Authorization은 basicAuthMode가 선점 — 2026-09-20 실측)
@@ -426,7 +426,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
     // quiet도 판정한다: QR/스크립트 경유 RP는 실턴이 전부 type=quiet로 들어온다 (2026-09-20 실측).
     // 같은 턴의 연쇄 quiet 생성은 아래 판정 캐시가 Jev 중복 호출을 막는다.
     if (!settings.jevApiKey) {
-        toastr.error('Jev API 키가 필요해요. 이번 턴은 주입 없이 넘어갈게요. (폴백은 없어요)', 'Jev Lorebook');
+        toastr.error('Jev API 키가 필요해요. 이번 턴은 주입 없이 넘어갈게요. (폴백은 없어요)', 'Lorebook Triage');
         return;
     }
 
@@ -564,7 +564,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         lastError = { ts: Date.now(), message: String(error?.message ?? error) };
         jevTransport = null; // 판정 실패 → 다음 턴 전송 경로 재감지 (플러그인/프록시가 중간에 꺼진 경우 대응)
         console.error(`${LOG} 실패 — 이번 턴 주입 0 (폴백 없음)`, error);
-        toastr.error(`Jev 판정에 실패했어요: ${error?.message ?? error}. 이번 턴은 주입 없이 넘어갈게요.`, 'Jev Lorebook');
+        toastr.error(`Jev 판정에 실패했어요: ${error?.message ?? error}. 이번 턴은 주입 없이 넘어갈게요.`, 'Lorebook Triage');
     }
 }
 
@@ -609,7 +609,7 @@ async function indexLorebook() {
     const settings = getSettings();
     const worlds = getTargetWorlds();
     if (!worlds.length) {
-        toastr.warning('색인할 대상이 없어요. 이 채팅/캐릭터에 로어북을 연결하거나, 설정에서 고정 대상을 선택해 주세요.', 'Jev Lorebook');
+        toastr.warning('색인할 대상이 없어요. 이 채팅/캐릭터에 로어북을 연결하거나, 설정에서 고정 대상을 선택해 주세요.', 'Lorebook Triage');
         return;
     }
 
@@ -625,19 +625,19 @@ async function indexLorebook() {
         }
 
         if (!totalItems) {
-            toastr.warning('색인할 항목이 없어요 (활성 상태이면서 본문이 있는 항목이 없어요).', 'Jev Lorebook');
+            toastr.warning('색인할 항목이 없어요 (활성 상태이면서 본문이 있는 항목이 없어요).', 'Lorebook Triage');
             $status.text('');
             return;
         }
 
         $status.text(`색인 완료: ${worlds.length}개 로어북 / ${totalItems}개 항목 (${new Date().toLocaleTimeString()})`);
-        toastr.success(`${totalItems}개 항목 색인을 마쳤어요 — ${worlds.join(', ')}`, 'Jev Lorebook');
+        toastr.success(`${totalItems}개 항목 색인을 마쳤어요 — ${worlds.join(', ')}`, 'Lorebook Triage');
         settings.embeddingDirty = false; // 새 임베딩 설정으로 재색인 완료 — 경고 해제
         saveSettingsDebounced();
         $('#jev_lorebook_reindex_warning').hide();
     } catch (error) {
         console.error(`${LOG} 색인 실패`, error);
-        toastr.error(`색인에 실패했어요: ${error?.message ?? error}`, 'Jev Lorebook');
+        toastr.error(`색인에 실패했어요: ${error?.message ?? error}`, 'Lorebook Triage');
         $status.text('색인에 실패했어요');
     } finally {
         $button.removeClass('disabled');
@@ -831,19 +831,19 @@ function getConvertProfileLabel() {
  */
 async function convertChatToLorebook(setStatus) {
     if (conversionInProgress) {
-        toastr.warning('변환이 이미 진행 중이에요.', 'Jev Lorebook');
+        toastr.warning('변환이 이미 진행 중이에요.', 'Lorebook Triage');
         return;
     }
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
     const world = getConversionTargetWorld();
     if (!world) {
-        toastr.error('대상 로어북이 없어요. 이 채팅 또는 캐릭터 카드에 로어북을 먼저 연결해 주세요. (자동으로 만들지는 않아요)', 'Jev Lorebook');
+        toastr.error('대상 로어북이 없어요. 이 채팅 또는 캐릭터 카드에 로어북을 먼저 연결해 주세요. (자동으로 만들지는 않아요)', 'Lorebook Triage');
         return;
     }
     const chat = ctx.chat ?? [];
     if (!chat.length) {
-        toastr.warning('채팅이 비어 있어요.', 'Jev Lorebook');
+        toastr.warning('채팅이 비어 있어요.', 'Lorebook Triage');
         return;
     }
     const keepRecent = Number.isFinite(Number(settings.keepRecent)) ? Math.max(0, Number(settings.keepRecent)) : defaultSettings.keepRecent;
@@ -851,7 +851,7 @@ async function convertChatToLorebook(setStatus) {
     const endIndex = chat.length - keepRecent; // 보존 버퍼 경계 — 변환·숨김 모두 여기까지만
     const fresh = endIndex > startIndex ? collectFreshMessages(chat, startIndex, endIndex) : [];
     if (!fresh.length) {
-        toastr.info(`변환할 새 메시지가 없어요 (변환 지점 ${startIndex}, 최근 ${keepRecent}개 보존, 전체 ${chat.length}).`, 'Jev Lorebook');
+        toastr.info(`변환할 새 메시지가 없어요 (변환 지점 ${startIndex}, 최근 ${keepRecent}개 보존, 전체 ${chat.length}).`, 'Lorebook Triage');
         return;
     }
 
@@ -944,12 +944,12 @@ async function convertChatToLorebook(setStatus) {
 
         const ms = Math.round(performance.now() - t0);
         setStatus(`완료: 사건 ${incidents.length}건 추가 · 코어 ${coreState ? '갱신' : '미갱신'} · ${indexed}개 색인 · 메시지 ${hiddenCount}개 변환·숨김, 최근 ${keepRecent}개 유지 (${ms}ms)`);
-        toastr.success(`변환을 마쳤어요: 사건 ${incidents.length}건 · 메시지 ${hiddenCount}개 숨김 · 최근 ${keepRecent}개는 원문 유지 — ${world}. 여기를 누르면 에디터에서 바로 확인할 수 있어요.`, 'Jev Lorebook', { onclick: () => openWorldEditor(world), timeOut: 10000 });
+        toastr.success(`변환을 마쳤어요: 사건 ${incidents.length}건 · 메시지 ${hiddenCount}개 숨김 · 최근 ${keepRecent}개는 원문 유지 — ${world}. 여기를 누르면 에디터에서 바로 확인할 수 있어요.`, 'Lorebook Triage', { onclick: () => openWorldEditor(world), timeOut: 10000 });
         console.log(`${LOG} 변환 완료 — 사건 ${incidents.length}건 / 변환 지점 ${startIndex}→${endIndex} / 숨김 ${hiddenCount}개 / ${ms}ms`);
     } catch (error) {
         console.error(`${LOG} 변환 실패`, error);
         setStatus(`실패했어요: ${error?.message ?? error}`);
-        toastr.error(`변환에 실패했어요: ${error?.message ?? error}`, 'Jev Lorebook');
+        toastr.error(`변환에 실패했어요: ${error?.message ?? error}`, 'Lorebook Triage');
     } finally {
         conversionInProgress = false;
     }
@@ -1067,7 +1067,7 @@ async function runSplitForWorld(world, uids, setStatus) {
 async function openSplitDialog(setStatus, $panel) {
     const worlds = getTargetWorlds();
     if (!worlds.length) {
-        toastr.error('대상 로어북이 없어요. 이 채팅/캐릭터에 로어북을 연결하거나 고정 대상을 설정해 주세요.', 'Jev Lorebook');
+        toastr.error('대상 로어북이 없어요. 이 채팅/캐릭터에 로어북을 연결하거나 고정 대상을 설정해 주세요.', 'Lorebook Triage');
         return;
     }
 
@@ -1110,7 +1110,7 @@ async function openSplitDialog(setStatus, $panel) {
     }
 
     if (!listedCount) {
-        toastr.info('스플릿할 항목이 없어요 (본문이 있는 항목이 없어요).', 'Jev Lorebook');
+        toastr.info('스플릿할 항목이 없어요 (본문이 있는 항목이 없어요).', 'Lorebook Triage');
         return;
     }
     $dialog.append($('<div class="jev-panel-muted">').text(`기본으로 ${candidateCount}개를 체크해 뒀어요 = 스플릿 후보 (날짜헤더 2개 이상 또는 대형 constant). 목록을 확인하고 체크를 자유롭게 바꾸셔도 돼요.`));
@@ -1135,7 +1135,7 @@ async function openSplitDialog(setStatus, $panel) {
         selection.get(world).push(uid);
     });
     if (!selection.size) {
-        toastr.info('선택된 항목이 없어서 아무것도 바꾸지 않았어요.', 'Jev Lorebook');
+        toastr.info('선택된 항목이 없어서 아무것도 바꾸지 않았어요.', 'Lorebook Triage');
         return;
     }
 
@@ -1151,7 +1151,7 @@ async function openSplitDialog(setStatus, $panel) {
         }
         setStatus(`스플릿 완료: ${totalSplit}항목 → ${totalChunks}덩어리 · 백업: ${backups.join(', ')}`);
         const firstWorld = selection.keys().next().value;
-        toastr.success(`${totalSplit}개 항목을 ${totalChunks}개 덩어리로 나눴어요. 백업: ${backups.join(', ')}. 여기를 누르면 에디터에서 바로 확인할 수 있어요.`, 'Jev Lorebook', { onclick: () => openWorldEditor(firstWorld), timeOut: 10000 });
+        toastr.success(`${totalSplit}개 항목을 ${totalChunks}개 덩어리로 나눴어요. 백업: ${backups.join(', ')}. 여기를 누르면 에디터에서 바로 확인할 수 있어요.`, 'Lorebook Triage', { onclick: () => openWorldEditor(firstWorld), timeOut: 10000 });
         if ($panel) {
             renderPanelSummary($panel);
             await renderPanelChunks($panel);
@@ -1159,7 +1159,7 @@ async function openSplitDialog(setStatus, $panel) {
     } catch (error) {
         console.error(`${LOG} 스플릿 실패`, error);
         setStatus(`스플릿에 실패했어요: ${error?.message ?? error}`);
-        toastr.error(`스플릿에 실패했어요: ${error?.message ?? error}`, 'Jev Lorebook');
+        toastr.error(`스플릿에 실패했어요: ${error?.message ?? error}`, 'Lorebook Triage');
     }
 }
 
@@ -1346,7 +1346,7 @@ async function openDetailPanel() {
         if ($button.hasClass('disabled')) return;
         const worlds = getTargetWorlds();
         if (!worlds.length) {
-            toastr.warning('색인 대상이 없다.', 'Jev Lorebook');
+            toastr.warning('색인 대상이 없다.', 'Lorebook Triage');
             return;
         }
         $button.addClass('disabled');
@@ -1359,7 +1359,7 @@ async function openDetailPanel() {
             await renderPanelChunks($panel);
         } catch (error) {
             setConvertStatus(`재색인 실패: ${error?.message ?? error}`);
-            toastr.error(`재색인 실패: ${error?.message ?? error}`, 'Jev Lorebook');
+            toastr.error(`재색인 실패: ${error?.message ?? error}`, 'Lorebook Triage');
         } finally {
             $button.removeClass('disabled');
         }
@@ -1379,7 +1379,7 @@ async function openDetailPanel() {
     $panel.find('#jev_panel_open_editor').on('click', function () {
         const world = getConversionTargetWorld();
         if (!world) {
-            toastr.warning('열 로어북이 없어요. 이 채팅/캐릭터에 로어북을 연결해 주세요.', 'Jev Lorebook');
+            toastr.warning('열 로어북이 없어요. 이 채팅/캐릭터에 로어북을 연결해 주세요.', 'Lorebook Triage');
             return;
         }
         openWorldEditor(world);
@@ -1527,7 +1527,7 @@ jQuery(async () => {
         <div id="jev_lorebook_wand_container" class="extension_container">
             <div id="jev_lorebook_wand_item" class="list-group-item flex-container flexGap5">
                 <div class="fa-solid fa-scale-balanced extensionsMenuExtensionButton"></div>
-                <span>Jev Lorebook</span>
+                <span>Lorebook Triage</span>
             </div>
         </div>`;
     $('#extensionsMenu').append(wandHtml);
