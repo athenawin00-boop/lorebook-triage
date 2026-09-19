@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="Lorebook Triage" width="720">
+  <img src="assets/banner.png" alt="Jev Lorebook" width="720">
 </p>
 
 <p align="center">
@@ -14,6 +14,10 @@
 </p>
 
 ---
+
+> **이름에 대하여** — 저장소 주소는 `lorebook-triage`, 확장 표시명은 **Jev Lorebook** 입니다.
+> 설치 폴더는 저장소 이름을 따라 `third-party/lorebook-triage` 가 되고, 콘솔 로그는 `[Jev Lorebook]` 으로 찍힙니다.
+
 
 **이런 분에게 필요합니다**
 
@@ -100,13 +104,13 @@ AI는 매번 답을 만들 때, 자기 앞에 놓인 종이들을 전부 읽고 
 고르기를 포기하고 전부 넣는 겁니다. 위의 3만 2천 토큰이 바로 이 경우입니다.
 빠뜨릴 걱정은 없지만, 대신 책상을 통째로 먹습니다.
 
-## 1-5. Lorebook Triage은 세 번째 방법을 넣습니다
+## 1-5. Jev Lorebook은 세 번째 방법을 넣습니다
 
 **매 턴, 지금 이 장면에 정말 필요한 항목만 "판단해서" 넣습니다.**
 
 같은 로어북, 같은 대화에서 실측한 결과:
 
-| | 기존 | Lorebook Triage |
+| | 기존 | Jev Lorebook |
 |---|---|---|
 | 매 턴 주입량 | 32,593토큰 | **3,959토큰** |
 | 방식 | 11개 전부 강제 | 후보 20개 회수 → **6개 채택** |
@@ -399,7 +403,7 @@ SillyTavern/plugins/jev-proxy/index.js
 > ⚠️ 전역 고정 옵션도 있지만 **일반적으로 쓰지 마세요.**
 > 한 캐릭터의 기억이 다른 모든 채팅에 주입되는 건 치명적입니다. 다른 캐릭터가 갑자기 모르는 사람 얘기를 합니다.
 
-**3단계. 채팅 하단 요술봉(🪄) → Lorebook Triage 패널 열기**
+**3단계. 채팅 하단 요술봉(🪄) → Jev Lorebook 패널 열기**
 
 여기가 조종석입니다.
 
@@ -523,7 +527,7 @@ SillyTavern 기본값은 컨텍스트의 25%입니다(200k면 최대 5만). 4,00
 
 ## 버그 제보
 
-요술봉 패널의 **판정 테이블** + F12 콘솔의 `[Lorebook Triage]` 로그를 함께 주시면 가장 빠릅니다.
+요술봉 패널의 **판정 테이블** + F12 콘솔의 `[Jev Lorebook]` 로그를 함께 주시면 가장 빠릅니다.
 
 ## 라이선스
 
