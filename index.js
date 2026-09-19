@@ -59,6 +59,7 @@ const SPLIT_MIN_CHUNK = 200;             // 이보다 작은 조각은 앞 덩�
 const SPLIT_EST_CHARS_PER_TOKEN = 3;     // 한글 혼용 보수 추정 (이식 원본과 동일)
 const SPLIT_BIG_CONSTANT_CHARS = 3000;   // constant 항목이 이 크기를 넘으면 기본 체크 후보 (≈1,000토큰)
 const CORE_TOKEN_LIMIT = 800;            // 코어 스냅샷 상한 — 프롬프트 강제, 초과 시 경고 로그
+const CORE_ORDER = 1000;                 // 코어 메모리 삽입 순서 — 일반 항목 기본값(100)보다 위
 // 변환 지시문 — 현이가 손으로 쓰던 프롬프트 + 파싱용 구조 강제 + 코어 상태 스냅샷(누적 서술 아님)
 const CONVERT_PROMPT = [
     'You are converting roleplay chat logs into lorebook entries.',
@@ -67,8 +68,6 @@ const CONVERT_PROMPT = [
     'Strict output format:',
     '- Begin each incident with a header line exactly like: ### YYYY-MM-DD — <short title>',
     '- Use the [Date: ...] markers in the transcript to date each incident. If unsure, use the most recent marker before the incident.',
-    '- End each incident with exactly one line: Keywords: k1, k2, k3, k4, k5',
-    '  (1 to 5 keywords, comma-separated; concrete names, places, objects, or events from that incident)',
     '- After all incidents, output one final section starting with the exact header line: ### CORE STATE',
     '  The core state is what must NEVER be forgotten between sessions.',
     '  You are given the [Previous core state]; UPDATE it with what changed in this transcript.',
@@ -79,7 +78,6 @@ const CONVERT_PROMPT = [
     '  Ongoing: <unresolved arcs, promises, plans — one per line, each starting with "- ">',
     '  Facts: <immutable facts: identities, secrets known/unknown, living situation — one per line, each starting with "- ">',
     '  Every line short and declarative. Keep the whole CORE STATE section under 800 tokens.',
-    '  Do not add a Keywords line to this section.',
     '- Output nothing else: no preamble, no commentary.',
 ].join('\n');
 
@@ -896,8 +894,10 @@ async function convertChatToLorebook(setStatus) {
             if (!entry) {
                 throw new Error('로어북 항목 uid 할당 실패');
             }
-            // 기존 split 규칙과 동일한 형태 (JEV_프로젝트.md §4-10)
-            entry.key = [inc.date, ...inc.keywords];
+            // 키워드 발동은 쓰지 않는다 — 발동 경로는 Jev(FORCE_ACTIVATE) 단일.
+            // 키를 달면 ST 재귀 스캔이 본문의 이름·날짜를 물고 연쇄 발동하는데,
+            // world_info_max_recursion_steps=0이면 제동이 아예 안 걸려 예산 상한까지 퍼붓는다. (2026-09-20)
+            entry.key = [];
             entry.comment = `${inc.title} · ${inc.date}`;
             entry.content = inc.body;
             entry.constant = false;
@@ -917,6 +917,7 @@ async function convertChatToLorebook(setStatus) {
                 coreEntry.comment = CORE_COMMENT;
             }
             coreEntry.key = [];
+            coreEntry.order = CORE_ORDER; // 일반 항목(기본 100)보다 위 — 프롬프트 최상단 고정
             coreEntry.content = coreState;
             coreEntry.constant = true;
             coreEntry.disable = false;
@@ -1035,7 +1036,7 @@ async function runSplitForWorld(world, uids, setStatus) {
             if (!chunk) continue;
             const newEntry = { uid: nextUid, ...structuredClone(newWorldInfoEntryTemplate) };
             newEntry.uid = nextUid; // 템플릿에 uid 기본값이 있어 재지정
-            newEntry.key = piece.date ? [piece.date] : [];
+            newEntry.key = []; // 키워드 발동 미사용 — 발동은 Jev 단일 경로
             newEntry.comment = piece.date ? `${title} · ${piece.date}` : `${title} · (머리말)`;
             newEntry.content = chunk;
             newEntry.constant = false; // 핵심: 통째 주입 중단
