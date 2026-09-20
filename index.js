@@ -323,6 +323,9 @@ function getTargetWorlds() {
  * v0.7.0까지의 동작 순서를 그대로 유지한다 — 기존 채팅의 저장처가 바뀌면 안 된다.
  * 발주자는 실사용에서 채팅 바인딩 북을 주로 쓴다(캐릭터 183장 중 카드에 북이 박힌 건 44장).
  * ⚠ 전역·페르소나는 어떤 경우에도 반환하지 않는다 — 전역 북에 사건이 쌓이면 모든 채팅으로 샌다.
+ * ⚠ 카드 북은 data.extensions.world 단독이다. getCharacterCardWorlds()를 쓰면
+ *   charLore.extraBooks(추가 로어북)까지 저장처 후보가 되는데, v0.7.0엔 없던 쓰기 대상이다.
+ *   그 층은 읽기 전용으로 둔다 — 쓰기 대상을 말없이 늘리면 사건이 엉뚱한 북으로 간다.
  */
 function getConversionTargetWorld() {
     const settings = getSettings();
@@ -331,9 +334,8 @@ function getConversionTargetWorld() {
     const ctx = SillyTavern.getContext();
     const chatWorld = ctx.chatMetadata?.[METADATA_KEY];
     if (chatWorld && typeof chatWorld === 'string' && known.has(chatWorld)) return chatWorld;
-    for (const name of getCharacterCardWorlds(ctx)) {
-        if (known.has(name)) return name;
-    }
+    const cardWorld = ctx.characters?.[ctx.characterId]?.data?.extensions?.world;
+    if (cardWorld && typeof cardWorld === 'string' && known.has(cardWorld)) return cardWorld;
     return '';
 }
 
