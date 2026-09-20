@@ -151,19 +151,27 @@ let lastConvertWarnings = [];
 //       workers_ai(계정 설정 필요), extras(deprecated). 근거 → 보고서 v0.5 섹션.
 // secretKey: secret_state 대조용 (vectors/index.js:1075 throwIfSourceInvalid 매핑 그대로)
 // modelFromRequest: 서버 getSourceSettings가 req.body.model을 읽는 소스만 true (vectors.js:214~ 검증)
+//
+// v0.7.0 추가 — 키를 '어디에' 넣는지 (최초 설치자가 입력칸을 못 찾는 게 실사용 1번 장벽):
+//   keyRoute 'chat'    = API 연결 → Chat Completion → 소스 선택 (index.html의 chat_completion_source 옵션에 존재)
+//   keyRoute 'text'    = API 연결 → Text Completion → 소스 선택 (togetherai만 여기, index.html:2435 실측)
+//   keyRoute 'vectors' = 확장의 Vector Storage 설정 안에서 관리 (nomicai는 API 연결 화면에 칸 자체가 없다,
+//                        vectors/settings.html:181 실측)
+//   stSource = ST 드롭다운에 실제로 찍혀 있는 문자열 그대로. 우리 label과 다를 수 있어 따로 둔다
+//              (label엔 '(모델 고정: …)' 같은 우리 주석이 붙어 있어 그대로 안내하면 못 찾는다)
 const EMBEDDING_SOURCES = {
-    palm:         { label: 'Google AI Studio (Gemini)', secretKey: SECRET_KEYS.MAKERSUITE, modelFromRequest: true, defaultModel: 'gemini-embedding-001' }, // text-embedding-005는 404 — 실측
-    transformers: { label: 'Local (Transformers) — 키 불필요', secretKey: null, modelFromRequest: false, defaultModel: '' },
-    openai:       { label: 'OpenAI', secretKey: SECRET_KEYS.OPENAI, modelFromRequest: true, defaultModel: 'text-embedding-3-small' },
-    cohere:       { label: 'Cohere', secretKey: SECRET_KEYS.COHERE, modelFromRequest: true, defaultModel: 'embed-english-v3.0' },
-    mistral:      { label: 'MistralAI (모델 고정: mistral-embed)', secretKey: SECRET_KEYS.MISTRALAI, modelFromRequest: false, defaultModel: '' },
-    togetherai:   { label: 'TogetherAI', secretKey: SECRET_KEYS.TOGETHERAI, modelFromRequest: true, defaultModel: 'togethercomputer/m2-bert-80M-32k-retrieval' },
-    nomicai:      { label: 'NomicAI (모델 고정: nomic-embed-text-v1.5)', secretKey: SECRET_KEYS.NOMICAI, modelFromRequest: false, defaultModel: '' },
-    openrouter:   { label: 'OpenRouter', secretKey: SECRET_KEYS.OPENROUTER, modelFromRequest: true, defaultModel: 'openai/text-embedding-3-large' },
-    electronhub:  { label: 'Electron Hub', secretKey: SECRET_KEYS.ELECTRONHUB, modelFromRequest: true, defaultModel: 'text-embedding-3-small' },
-    nanogpt:      { label: 'NanoGPT', secretKey: SECRET_KEYS.NANOGPT, modelFromRequest: true, defaultModel: 'text-embedding-3-small' },
-    siliconflow:  { label: 'SiliconFlow', secretKey: SECRET_KEYS.SILICONFLOW, modelFromRequest: true, defaultModel: 'Qwen/Qwen3-Embedding-0.6B' },
-    chutes:       { label: 'Chutes', secretKey: SECRET_KEYS.CHUTES, modelFromRequest: true, defaultModel: 'chutes-qwen-qwen3-embedding-8b' },
+    palm:         { label: 'Google AI Studio (Gemini)', secretKey: SECRET_KEYS.MAKERSUITE, modelFromRequest: true, defaultModel: 'gemini-embedding-001', keyRoute: 'chat', stSource: 'Google AI Studio' }, // text-embedding-005는 404 — 실측
+    transformers: { label: 'Local (Transformers) — 키 불필요', secretKey: null, modelFromRequest: false, defaultModel: '', keyRoute: null, stSource: '' },
+    openai:       { label: 'OpenAI', secretKey: SECRET_KEYS.OPENAI, modelFromRequest: true, defaultModel: 'text-embedding-3-small', keyRoute: 'chat', stSource: 'OpenAI' },
+    cohere:       { label: 'Cohere', secretKey: SECRET_KEYS.COHERE, modelFromRequest: true, defaultModel: 'embed-english-v3.0', keyRoute: 'chat', stSource: 'Cohere' },
+    mistral:      { label: 'MistralAI (모델 고정: mistral-embed)', secretKey: SECRET_KEYS.MISTRALAI, modelFromRequest: false, defaultModel: '', keyRoute: 'chat', stSource: 'MistralAI' },
+    togetherai:   { label: 'TogetherAI', secretKey: SECRET_KEYS.TOGETHERAI, modelFromRequest: true, defaultModel: 'togethercomputer/m2-bert-80M-32k-retrieval', keyRoute: 'text', stSource: 'TogetherAI' },
+    nomicai:      { label: 'NomicAI (모델 고정: nomic-embed-text-v1.5)', secretKey: SECRET_KEYS.NOMICAI, modelFromRequest: false, defaultModel: '', keyRoute: 'vectors', stSource: 'NomicAI' },
+    openrouter:   { label: 'OpenRouter', secretKey: SECRET_KEYS.OPENROUTER, modelFromRequest: true, defaultModel: 'openai/text-embedding-3-large', keyRoute: 'chat', stSource: 'OpenRouter' },
+    electronhub:  { label: 'Electron Hub', secretKey: SECRET_KEYS.ELECTRONHUB, modelFromRequest: true, defaultModel: 'text-embedding-3-small', keyRoute: 'chat', stSource: 'Electron Hub' },
+    nanogpt:      { label: 'NanoGPT', secretKey: SECRET_KEYS.NANOGPT, modelFromRequest: true, defaultModel: 'text-embedding-3-small', keyRoute: 'chat', stSource: 'NanoGPT' },
+    siliconflow:  { label: 'SiliconFlow', secretKey: SECRET_KEYS.SILICONFLOW, modelFromRequest: true, defaultModel: 'Qwen/Qwen3-Embedding-0.6B', keyRoute: 'chat', stSource: 'SiliconFlow' },
+    chutes:       { label: 'Chutes', secretKey: SECRET_KEYS.CHUTES, modelFromRequest: true, defaultModel: 'chutes-qwen-qwen3-embedding-8b', keyRoute: 'chat', stSource: 'Chutes' },
 };
 
 // 설정 숫자칸 범위 — UI(min/max)와 읽기 쪽 클램프가 같은 값을 써야 한다 (UI만 막으면 수동 설정 파일 편집을 못 막는다)
@@ -185,7 +193,7 @@ const defaultSettings = Object.freeze({
     embeddingSource: 'palm',   // 기존 하드코딩(palm)과 동일한 기본값 — 동작 불변
     embeddingModel: '',        // 빈 값 = 소스별 기본 모델
     embeddingDirty: false,     // 임베딩 설정 변경 후 재색인 전 = true (경고 표시)
-    convertProfileId: '',      // 빈 값 = 현재 연결 그대로 // 변환·숨김에서 제외할 최근 메시지 수 — 직전 장면은 원문으로 남아야 한다
+    convertProfileId: '',      // 빈 값 = 현재 연결된 메인 API // 변환·숨김에서 제외할 최근 메시지 수 — 직전 장면은 원문으로 남아야 한다
     // ── v0.7.0 신규 ──
     sliceTokens: DEFAULT_SLICE_TOKENS,          // 슬라이스당 전사 토큰 상한
     convertMaxTokens: DEFAULT_CONVERT_MAX_TOKENS, // 변환 응답 최대 토큰 (프로필 경로에만 직접 먹임)
@@ -1103,7 +1111,7 @@ function getConvertProfileBadge() {
         // 그래서 조용히 잘리는 대신 배지에서 먼저 경고한다.
         return {
             icon: 'fa-plug',
-            text: '현재 연결 그대로',
+            text: '현재 연결된 메인 API',
             note: 'ST 응답 최대 토큰 설정을 따라요 — 낮으면 잘려요',
             warn: true,
         };
@@ -1150,7 +1158,7 @@ function renderPanelWarnings($panel) {
 /** 변환 프로필 표시명 — 패널·상태줄용 */
 function getConvertProfileLabel() {
     const settings = getSettings();
-    if (!settings.convertProfileId) return '현재 연결 그대로';
+    if (!settings.convertProfileId) return '현재 연결된 메인 API';
     try {
         return ConnectionManagerRequestService.getProfile(settings.convertProfileId)?.name ?? settings.convertProfileId;
     } catch {
@@ -1944,12 +1952,22 @@ function updateEmbeddingSourceUi() {
     const settings = getSettings();
     const meta = EMBEDDING_SOURCES[settings.embeddingSource] ?? EMBEDDING_SOURCES.palm;
     const $status = $('#jev_lorebook_key_status');
+    const $help = $('#jev_lorebook_key_help');
+    // 키 입력칸을 우리가 안 가지고 있다는 걸 명시해야 한다 — 설정탭에 칸이 없으니 최초 설치자는 어디에 넣는지 몰라 막힌다 (현이 실사용 제보, 2026-09-20).
+    // 진짜 함정은 마지막 줄이다: Claude로 RP하는 사람은 Gemini 소스를 열 이유가 없어서 입력칸 자체를 못 본다.
     if (meta.secretKey === null) {
         $status.text('로컬 소스라 API 키가 필요 없어요.').removeClass('jev-key-missing');
+        $help.hide().empty();
     } else if (secret_state[meta.secretKey]) {
         $status.text('키 등록됨 ✓').removeClass('jev-key-missing');
+        $help.hide().empty(); // 끝난 사람한테 잔소리하지 않는다
     } else {
-        $status.text('키 미등록 — SillyTavern의 API 연결 화면에서 키를 등록해 주세요.').addClass('jev-key-missing');
+        $status.text('키 미등록 ✗').addClass('jev-key-missing');
+        $help.empty()
+            .append($('<div>').text('이 키는 확장이 따로 받지 않고 SillyTavern에 저장된 키를 그대로 써요.'))
+            .append($('<div>').text(`등록: 상단 🔌 API 연결 → API를 'Chat Completion'으로 → 소스를 '${meta.label}'로 고른 뒤, API 키를 붙여넣고 [Connect]를 누르면 저장돼요.`))
+            .append($('<div>').addClass('jev-key-help-punch').text('저장되면 채팅 연결은 원래 쓰던 소스로 되돌려도 키는 그대로 남아요.'))
+            .show();
     }
     const $model = $('#jev_lorebook_embed_model');
     $model.prop('disabled', !meta.modelFromRequest);
@@ -1957,21 +1975,21 @@ function updateEmbeddingSourceUi() {
     $('#jev_lorebook_reindex_warning').toggle(!!settings.embeddingDirty);
 }
 
-/** 변환 프로필 셀렉트 채우기 — connection-manager 비활성이면 행 숨김(현재 연결 그대로 동작) */
+/** 변환 프로필 셀렉트 채우기 — connection-manager 비활성이면 행 숨김(현재 연결된 메인 API로 동작) */
 function populateConvertProfiles() {
     const settings = getSettings();
     const $row = $('#jev_lorebook_profile_row');
     try {
         const profiles = ConnectionManagerRequestService.getSupportedProfiles(); // shared.js:525
         const $select = $('#jev_lorebook_convert_profile');
-        $select.empty().append($('<option>').val('').text('— 현재 연결 그대로 —'));
+        $select.empty().append($('<option>').val('').text('— 현재 연결된 메인 API —'));
         for (const p of profiles) {
             $select.append($('<option>').val(p.id).text(p.name || p.id));
         }
         $select.val(settings.convertProfileId || '');
         $row.show();
     } catch (error) {
-        console.log(`${LOG} connection-manager 비활성 — 변환 프로필 선택 숨김 (현재 연결 그대로): ${error?.message ?? error}`);
+        console.log(`${LOG} connection-manager 비활성 — 변환 프로필 선택 숨김 (현재 연결된 메인 API로 동작): ${error?.message ?? error}`);
         $row.hide();
     }
 }

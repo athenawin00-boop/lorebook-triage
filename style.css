@@ -176,6 +176,27 @@
     color: var(--warning, #e5a50a);
 }
 
+/* 키 미등록일 때만 뜨는 등록 경로 안내 (v0.7.0).
+   확장이 임베딩 키를 직접 안 받는다는 사실이 UI에 전혀 안 드러나서 최초 설치자가 막혔다. */
+.jev-key-help {
+    margin: 4px 0 2px;
+    padding: 8px 10px;
+    border-left: 3px solid var(--warning, #e5a50a);
+    background-color: var(--black30a, rgba(0, 0, 0, 0.15));
+    border-radius: 4px;
+    font-size: 0.9em;
+    line-height: 1.5;
+    opacity: 0.95;
+}
+
+.jev-key-help > div + div {
+    margin-top: 4px;
+}
+
+.jev-key-help-punch {
+    font-weight: 600;
+}
+
 .jev-profile-row {
     display: flex;
     flex-direction: column;
