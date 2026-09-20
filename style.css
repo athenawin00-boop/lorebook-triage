@@ -517,3 +517,20 @@
 .jev-kind-badge.jev-kind-keyword {
     opacity: 0.8;
 }
+
+/* ── Jev 탈락 후보 접힘 블록 (v0.9.1) ──────────────────
+   두 표를 하나로 합치면서, 채택되지 못한 판정 후보는 여기로 내렸다.
+   토글 자체는 전문 펼침(.jev-detail-toggle)과 같은 시각 언어를 쓴다. */
+.jev-reject-block {
+    margin-top: 10px;
+}
+
+.jev-reject-toggle {
+    opacity: 0.7;
+}
+
+.jev-reject-body {
+    padding-left: 6px;
+    border-left: 2px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+    margin-top: 6px;
+}

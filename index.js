@@ -1783,25 +1783,21 @@ async function fillStackTokens($slots, chat, from, to, keepRecent, chatLength) {
     }
 }
 
-/** 직전 턴 판정 리포트 렌더 — 북별 그룹 헤더로 묶는다 (v0.8.0: 4계층이라 여러 북이 섞인다) */
-function renderPanelJudgment($panel) {
-    const $box = $panel.find('#jev_panel_judgment').empty();
-
-    if (lastError) {
-        $box.append($('<div class="jev-panel-error">').text(`⚠ 직전 판정이 실패했어요 (${new Date(lastError.ts).toLocaleTimeString()}): ${lastError.message}`));
-    }
-    if (!lastReport) {
-        $box.append($('<div class="jev-panel-muted">').text('아직 판정 기록이 없어요. 생성을 한 번 진행한 뒤 다시 열어 주세요.'));
-        return;
-    }
-
+/**
+ * Jev 탈락 후보 표 (v0.9.1) — 접힘 블록 안에서만 그린다.
+ * v0.9.0까지 '직전 턴 판정' 섹션의 본체였던 렌더를 그대로 옮겨 왔다(3축 점수 세부 = 모순위험/장면적합/최근중복).
+ * 채택분은 위 주입 표에 🧠로 이미 있으니 여기서는 탈락분만 나열한다 — 같은 사건이 두 번 나오던 게 소음의 주범이었다.
+ * 북별 그룹 헤더는 v0.8.0 패턴 그대로(4계층이라 여러 북이 섞인다).
+ */
+function renderPanelJudgment($box, rejected) {
     const meta = `${new Date(lastReport.ts).toLocaleTimeString()} · type=${lastReport.type} · 후보 ${lastReport.candidateCount} → 채택 ${lastReport.adoptedCount} · ${lastReport.usedTokens}토큰 · ${lastReport.ms}ms`
         + (lastReport.cacheHits ? ` · 캐시 재사용 ${lastReport.cacheHits}회` : '')
         + ` — 대상 ${lastReport.worlds.length}개: ${lastReport.worlds.join(', ')}`;
     $box.append($('<div class="jev-panel-muted">').text(meta));
 
     // '월드' 칸을 없애고 그룹 헤더로 올렸다 — 16자로 잘린 칸으로는 북이 여럿일 때 분간이 안 된다.
-    const headers = ['채택', 'uid', '제목', '모순위험', '장면적합', '최근중복', '최종', '토큰', ''];
+    // '채택' 칸은 v0.9.1에서 없앴다 — 여기 오는 행은 전부 탈락분이라 빈 칸만 남는다.
+    const headers = ['uid', '제목', '모순위험', '장면적합', '최근중복', '최종', '토큰', ''];
     const $table = $('<table class="jev-panel-table">');
     const $thead = $('<tr>');
     for (const h of headers) {
@@ -1812,24 +1808,22 @@ function renderPanelJudgment($panel) {
 
     const layerOf = new Map(getTargetWorldsDetailed().map(d => [d.name, d.layer]));
     const groups = new Map();
-    for (const r of lastReport.rows) {
+    for (const r of rejected) {
         const key = String(r.world);
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(r);
     }
 
     for (const [world, rows] of groups) {
-        const adoptedCount = rows.filter(r => r.adopted).length;
         const $groupCell = $('<td>').attr('colspan', headers.length);
         const layer = layerOf.get(world);
         if (layer) $groupCell.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
         $groupCell.append($('<span class="jev-group-name">').text(world));
-        $groupCell.append($('<span class="jev-group-meta">').text(`후보 ${rows.length}개 · 채택 ${adoptedCount}개`));
+        $groupCell.append($('<span class="jev-group-meta">').text(`탈락 ${rows.length}개`));
         $tbody.append($('<tr class="jev-panel-group-row">').append($groupCell));
 
         for (const r of rows) {
-            const $tr = $('<tr>').toggleClass('jev-adopted', r.adopted);
-            $tr.append($('<td>').text(r.adopted ? '✓' : ''));
+            const $tr = $('<tr>');
             $tr.append($('<td>').text(r.uid));
             $tr.append($('<td class="jev-cell-title">').text(String(r.title).slice(0, 48)));
             $tr.append($('<td>').text(r.contradiction.toFixed(2)));
@@ -1964,11 +1958,17 @@ async function renderPanelChunks($panel) {
     }
 }
 
+/** 합친 섹션 제목 (v0.9.1) — 한 군데서만 쓴다. 패널은 언제나 지나간 턴을 본다. */
+const INJECTED_TITLE = '직전 턴 — 프롬프트에 들어간 것';
+
 /**
- * 이번 턴 실제 주입 (v0.9.0) — 우리 판정이 아니라 ST가 프롬프트에 정말로 넣은 것.
+ * 직전 턴 — 프롬프트에 들어간 것 (v0.9.1).
+ * v0.9.0까지는 '직전 턴 판정'(인터셉터, WI 스캔 전)과 '이번 턴 실제 주입'(WORLD_INFO_ACTIVATED, 스캔 후)을
+ * 따로 그렸다. 둘은 같은 턴의 같은 사건을 두 각도에서 본 것이라 Jev 채택분이 양쪽에 중복으로 나왔다.
+ * → 기준을 '프롬프트에 들어갔나' 하나로 합치고, 탈락 후보는 접힘 블록으로 내렸다.
  * 분류 3종:
  *   ⭐ 코어    entry.constant === true (ST 네이티브 매턴 주입)
- *   🧠 Jev     우리 채택 집합(lastJudgment.items)에 있는 것 = FORCE_ACTIVATE로 넣은 것
+ *   🧠 Jev     lastReport의 채택 집합에 있는 것 = FORCE_ACTIVATE로 넣은 것
  *   🔑 키워드  나머지 전부 (키워드·sticky·데코레이터·min_activations — 확장 예산 밖에서 걸린 것들)
  * 키워드와 Jev는 OR로 병존한다. 이중 주입은 ST가 allActivatedEntries를
  * `${world}.${uid}` 키 Map으로 들고 있어 자연 방지된다 (world-info.js:4685·4956 실측).
@@ -1977,30 +1977,37 @@ function renderPanelInjected($panel) {
     const $box = $panel.find('#jev_panel_injected').empty();
     const $title = $panel.find('#jev_panel_injected_title');
 
+    // 판정 실패는 접힘 블록에 숨기지 않는다 — 표가 비는 이유가 여기 있을 수 있다.
+    if (lastError) {
+        $box.append($('<div class="jev-panel-error">').text(`⚠ 직전 판정이 실패했어요 (${new Date(lastError.ts).toLocaleTimeString()}): ${lastError.message}`));
+    }
+
     if (!lastActivated || !lastActivated.entries.length) {
-        $title.text('이번 턴 실제 주입');
+        $title.text(INJECTED_TITLE);
         $box.append($('<div class="jev-panel-muted">').text('아직 기록이 없어요 — 메시지를 한 번 보내면 여기에 표시돼요.'));
         return;
     }
 
-    const adoptedKeys = new Set((lastJudgment?.items ?? []).map(i => `${i.world}.${i.uid}`));
+    // 채택 여부·최종점수·판정 시점 본문은 전부 lastReport에서 온다.
+    // lastReport가 없으면(첫 로드/판정 실패) 점수 칸과 탈락 블록만 빠지고 표는 그대로 그린다.
+    const reportRows = new Map((lastReport?.rows ?? []).map(r => [`${r.world}.${r.uid}`, r]));
     const KIND_BADGE = { core: '⭐ 코어', jev: '🧠 Jev', keyword: '🔑 키워드' };
     const classify = (e) => (e.constant === true)
         ? 'core'
-        : (adoptedKeys.has(`${e.world}.${e.uid}`) ? 'jev' : 'keyword');
+        : (reportRows.get(`${e.world}.${e.uid}`)?.adopted ? 'jev' : 'keyword');
 
     const rows = lastActivated.entries.map(e => ({ entry: e, kind: classify(e) }));
     const counts = { core: 0, jev: 0, keyword: 0 };
     for (const r of rows) counts[r.kind]++;
     // 토큰은 비동기라 제목줄은 개수부터 띄우고 뒤에서 채운다 (fillStackTokens 선례, v0.6.3)
-    $title.text(`이번 턴 실제 주입 — ⭐${counts.core} / 🧠${counts.jev} / 🔑${counts.keyword} · 집계 중…`);
+    $title.text(`${INJECTED_TITLE} — ⭐${counts.core} / 🧠${counts.jev} / 🔑${counts.keyword} · 집계 중…`);
 
     $box.append($('<div class="jev-panel-muted">').text(
         `${new Date(lastActivated.ts).toLocaleTimeString()} 생성 · 총 ${rows.length}개`));
 
     // 북별 그룹 헤더로 묶는다 (v0.8.0 패턴 재사용) — 4계층이라 여러 북이 섞인다.
     const layerOf = new Map(getTargetWorldsDetailed().map(d => [d.name, d.layer]));
-    const headers = ['분류', '제목', '≈토큰', ''];
+    const headers = ['분류', '제목', '점수', '≈토큰', ''];
     const $table = $('<table class="jev-panel-table">');
     const $thead = $('<tr>');
     for (const h of headers) {
@@ -2029,10 +2036,17 @@ function renderPanelInjected($panel) {
         $tbody.append($('<tr class="jev-panel-group-row">').append($groupCell));
 
         for (const r of groupRows) {
-            const content = String(r.entry.content ?? '');
+            const reportRow = reportRows.get(`${r.entry.world}.${r.entry.uid}`);
+            // 🧠는 판정 시점 본문이 lastReport에 박제돼 있다(v0.6.4 결정) — 그걸 보여준다.
+            // ⭐·🔑는 판정을 안 거쳤으니 WORLD_INFO_ACTIVATED가 준 본문 그대로.
+            const content = (r.kind === 'jev' && reportRow)
+                ? String(reportRow.text ?? '')
+                : String(r.entry.content ?? '');
             const $tr = $('<tr>').toggleClass('jev-adopted', r.kind === 'jev');
             $tr.append($('<td>').append($('<span class="jev-kind-badge">').addClass(`jev-kind-${r.kind}`).text(KIND_BADGE[r.kind])));
             $tr.append($('<td class="jev-cell-title">').text(String(r.entry.comment || `uid ${r.entry.uid}`).slice(0, 48)));
+            // 점수는 판정을 거친 🧠만. ⭐·🔑에 숫자를 지어내면 표가 거짓말을 한다.
+            $tr.append($('<td>').text((r.kind === 'jev' && reportRow) ? reportRow.final.toFixed(3) : '—'));
             const $tok = $('<td>').text('…');
             $tr.append($tok);
 
@@ -2047,6 +2061,29 @@ function renderPanelInjected($panel) {
     }
     $table.append($tbody);
     $box.append($table);
+
+    // Jev 탈락 후보는 기본 접힘 (v0.9.1) — 볼 게 많다는 호소의 주범이라 평소엔 숨긴다.
+    const rejected = (lastReport?.rows ?? []).filter(r => !r.adopted);
+    if (rejected.length) {
+        const best = rejected.reduce((max, r) => Math.max(max, Number(r.final) || 0), 0);
+        const $body = $('<div class="jev-reject-body" style="display: none;">');
+        const $toggle = $('<div class="jev-detail-toggle jev-reject-toggle" role="button" tabindex="0">')
+            .attr('title', '채택되지 못한 판정 후보와 3축 점수를 펼쳐서 봐요')
+            .append($('<i class="fa-solid fa-chevron-right">'))
+            .append($('<span>').text(`Jev 탈락 후보 ${rejected.length}개 (최고 ${best.toFixed(2)})`));
+        const toggleBlock = () => {
+            const opening = $body.css('display') === 'none';
+            $body.toggle(opening);
+            $toggle.toggleClass('jev-open', opening)
+                .find('i').toggleClass('fa-chevron-right', !opening).toggleClass('fa-chevron-down', opening);
+        };
+        $toggle.on('click', toggleBlock);
+        $toggle.on('keydown', (ev) => {
+            if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggleBlock(); }
+        });
+        $box.append($('<div class="jev-reject-block">').append($toggle).append($body));
+        renderPanelJudgment($body, rejected);
+    }
 
     void fillInjectedTokens($title, $tokenCells, ordered);
 }
@@ -2066,21 +2103,20 @@ async function fillInjectedTokens($title, $cells, rows) {
             $cells[i].text(tokens[i].toLocaleString());
         }
         const sum = totals.core + totals.jev + totals.keyword;
-        $title.text('이번 턴 실제 주입 — '
+        $title.text(`${INJECTED_TITLE} — `
             + `⭐${counts.core}·${totals.core.toLocaleString()}tok / `
             + `🧠${counts.jev}·${totals.jev.toLocaleString()}tok / `
             + `🔑${counts.keyword}·${totals.keyword.toLocaleString()}tok`
             + ` · 합계 ${sum.toLocaleString()}tok`);
     } catch (error) {
-        $title.text(`이번 턴 실제 주입 — 토큰 집계에 실패했어요: ${error?.message ?? error}`);
+        $title.text(`${INJECTED_TITLE} — 토큰 집계에 실패했어요: ${error?.message ?? error}`);
     }
 }
 /** 패널 전체 갱신 */
 async function refreshPanel($panel) {
     renderPanelSummary($panel);
     renderPanelWarnings($panel);
-    renderPanelJudgment($panel);
-    renderPanelInjected($panel);
+    renderPanelInjected($panel); // 탈락 후보(renderPanelJudgment)는 이 안의 접힘 블록에서 그려진다
     await renderPanelChunks($panel);
 }
 
