@@ -40,7 +40,9 @@ const JEV_MODEL = 'jev-latest';
 const JEV_TIMEOUT_MS = 20000;
 const JEV_PROBE_TIMEOUT_MS = 8000;
 
-const QUERY_TOP_K = 30;          // 벡터 회수 후보 수 — 20으론 Jev 상위권을 놓침(2026-09-20 실측)
+const DEFAULT_TOP_K = 30;        // 벡터 회수 후보 수 기본값 — 20으론 Jev 상위권을 놓침(2026-09-20 실측). v0.7.0에서 설정(20~50)으로 개방
+const TOP_K_MIN = 20;
+const TOP_K_MAX = 50;
 const SCORE_FLOOR = 0.5;         // 최종 점수 하한. 대조실험 눈금: 0.74=빼면 모순 / 0.52=장면만 맞음 / 0.37=무관
 const QUERY_USER_MESSAGES = 3;   // 검색 쿼리로 쓸 최근 유저 메시지 수
 const SCENE_MESSAGES = 6;        // Jev에 보여줄 최근 장면 메시지 수
@@ -49,7 +51,11 @@ const JUDGMENT_CACHE_MS = 60000; // 동일 쿼리 판정 캐시 (같은 턴의 �
 
 // ── 변환 파이프라인 상수 ────────────────────────────────────────────────
 const CONVERT_META_KEY = 'jevLorebookLastConverted'; // chat_metadata에 저장하는 마지막 변환 지점 (chat 배열 인덱스, exclusive)
-const SLICE_TOKEN_BUDGET = 18000; // 슬라이스당 대화 토큰 상한 (지시문·응답 여유 포함해 2만 이하로)
+// 작중 날짜 앵커 (v0.7.0) — 실제 send_date가 아니라 '이야기 속 날짜'의 기준점. 이 채팅에만 귀속.
+// send_date는 "내가 언제 쳤나"라 작중 시간과 무관하다 — 하루에 작중 3개월을 쓸 수도 있다 (현이 지적, 2026-09-20)
+const STORY_ANCHOR_META_KEY = 'jevLorebookStoryAnchor';
+const DEFAULT_SLICE_TOKENS = 18000; // 슬라이스당 대화 토큰 상한 기본값. v0.7.0에서 설정으로 개방
+const REAL_GAP_HOURS = 6;           // 실제 시간이 이만큼 벌어지면 전사에 장면 경계 힌트를 남긴다 (약한 힌트일 뿐)
 const CORE_COMMENT = '⭐ Core Memory';   // 코어 메모리 항목 식별자 (comment 고정 = upsert 키)
 
 // ── 스플릿(v0.4) 상수 — st_lorebook_split.py 규칙의 JS 이식 ─────────────────
@@ -61,25 +67,65 @@ const SPLIT_BIG_CONSTANT_CHARS = 3000;   // constant 항목이 이 크기를 넘
 const CORE_TOKEN_LIMIT = 800;            // 코어 스냅샷 상한 — 프롬프트 강제, 초과 시 경고 로그
 const CORE_ORDER = 1000;                 // 코어 메모리 삽입 순서 — 일반 항목 기본값(100)보다 위
 const NORMAL_ORDER = 100;                // 일반(검색층) 항목 순서 — 코어에서 강등할 때 되돌리는 값
-// 변환 지시문 — 현이가 손으로 쓰던 프롬프트 + 파싱용 구조 강제 + 코어 상태 스냅샷(누적 서술 아님)
-const CONVERT_PROMPT = [
+// 문장 종결부호 — 응답 끝줄이 이걸로 안 끝나면 잘림 의심 (프로필·현재연결 양쪽 공통 휴리스틱)
+const SENTENCE_END_RE = /[.!?"”'’)」』]$/;
+const TRUNCATION_RATIO = 0.95;           // 응답 토큰이 상한의 이 비율을 넘으면 잘림 의심 (v0.7.0)
+
+// ── 변환 프롬프트 (v0.7.0에서 2분할) ──────────────────────────────────
+// 하나였던 CONVERT_PROMPT를 '스타일부(유저 편집 가능)'와 '계약부(잠금)'으로 갈랐다.
+// 이유: 문체를 바꾸고 싶다는 요구는 잦은데, 출력 형식을 같이 건드리면 파서가 통째로 죽는다.
+// 형식은 코드가 의존하는 계약이라 유저 손이 닿으면 안 된다.
+const DEFAULT_CONVERT_STYLE = [
     'You are converting roleplay chat logs into lorebook entries.',
-    'For the lorebook, summarize each incident in six or more sentences. Quote dialogue when necessary. Separate by date. Output in English.',
+    'Summarize each incident in six or more sentences. Quote dialogue when necessary. Output in English.',
+].join('\n');
+
+/**
+ * 사건 추출용 system prompt 조립 — 스타일부(유저) + 계약부(잠금).
+ * 작중 날짜(in-story date)를 쓰게 한다: send_date는 "내가 언제 쳤나"라 작중 시간과 무관하다.
+ * 번호는 여기서 금지하고 코드 후처리로 붙인다 — 모델은 슬라이스마다 1부터 다시 세서 중복 번호를 만든다.
+ */
+function buildIncidentsPrompt(style, incidentMaxTokens, anchor) {
+    const anchorText = String(anchor || '').trim() || 'unknown';
+    return [
+        String(style || '').trim() || DEFAULT_CONVERT_STYLE,
+        '',
+        'Strict output format (locked — always follow this exactly):',
+        '- Begin each incident with a header line exactly like: ### YYYY-MM-DD — <short title>',
+        '- Do NOT number the incidents in any way. Numbering is assigned afterwards by the tool.',
+        '- The date is the IN-STORY date, not the real-world time at which the log was written.',
+        '  Decide it in this order:',
+        '  1) If the transcript itself states an in-story date, use that date.',
+        `  2) Otherwise, count the in-story time elapsed from [Anchor: ${anchorText}] ('the next day', 'three days later', ...) and compute the date.`,
+        '  3) If neither is possible, reuse the anchor date as-is.',
+        '- If one day contains clearly distinct scenes, split them into separate incidents.',
+        '  The same date header may appear several times; that is expected.',
+        `- Each incident is 6-12 sentences and stays under ${incidentMaxTokens} tokens.`,
+        '- Optionally add one line per incident, exactly like: Keywords: a, b, c (at most 5).',
+        '- Output nothing else: no preamble, no commentary.',
+    ].join('\n');
+}
+
+/**
+ * 코어 갱신 전용 system prompt — 유저 편집 불가 (구조가 깨지면 코어 항목 upsert가 통째로 죽는다).
+ * v0.7.0에서 사건 추출과 분리했다: 슬라이스마다 코어를 같이 시키면
+ * (a) 사건 출력 예산을 코어가 갈라먹고 (b) 중간 슬라이스의 코어는 어차피 버려진다 — 호출 낭비.
+ */
+const CORE_PROMPT = [
+    'You maintain the CORE STATE of an ongoing roleplay: what must NEVER be forgotten between sessions.',
+    'You are given the [Previous core state] and the [New incidents] extracted from the latest logs.',
+    'UPDATE the previous core state with what changed in the new incidents.',
+    'Present state only, never a running log of events. If nothing changed, restate it as-is.',
     '',
     'Strict output format:',
-    '- Begin each incident with a header line exactly like: ### YYYY-MM-DD — <short title>',
-    '- Use the [Date: ...] markers in the transcript to date each incident. If unsure, use the most recent marker before the incident.',
-    '- After all incidents, output one final section starting with the exact header line: ### CORE STATE',
-    '  The core state is what must NEVER be forgotten between sessions.',
-    '  You are given the [Previous core state]; UPDATE it with what changed in this transcript.',
-    '  Present state only, never a running log of events. If nothing changed, restate it as-is.',
-    '  Format as short labeled lines — NO flowing prose, NO paragraphs:',
+    '- Output exactly one section, starting with the exact header line: ### CORE STATE',
+    '- Format as short labeled lines — NO flowing prose, NO paragraphs:',
     '  Relationship: <the current state in one line, as it stands NOW (confession/dating/conflict/etc.)>',
     '  Dynamics: <how they treat each other now, 1-2 short lines>',
     '  Ongoing: <unresolved arcs, promises, plans — one per line, each starting with "- ">',
     '  Facts: <immutable facts: identities, secrets known/unknown, living situation — one per line, each starting with "- ">',
-    '  Every line short and declarative. Keep the whole CORE STATE section under 800 tokens.',
-    '- Output nothing else: no preamble, no commentary.',
+    `- Every line short and declarative. Keep the whole CORE STATE section under ${CORE_TOKEN_LIMIT} tokens.`,
+    '- Output in English. Output nothing else: no preamble, no commentary.',
 ].join('\n');
 
 /** 직전 판정 결과 — 채팅이 안 전진했으면 Jev 재호출 없이 재주입만 한다 */
@@ -94,6 +140,11 @@ let conversionInProgress = false;
 let jevTransport = null; // { kind: 'plugin'|'cors', endpoint, label }
 /** 마지막 경로 감지 실패 사유 — 패널 표시용 */
 let lastTransportError = null;
+/**
+ * 직전 변환에서 모인 경고 — 패널 표시용 (v0.7.0).
+ * 토스트는 몇 초 뒤면 사라지는데 "잘렸을지도 모른다"는 나중에 확인하고 싶은 정보라 남긴다.
+ */
+let lastConvertWarnings = [];
 
 // ── 임베딩 소스 (v0.5) — vectors 확장 지원 소스의 부분집합 ─────────────────
 // 제외: ollama/llamacpp/vllm/koboldcpp(서버 URL 필요), webllm(브라우저 모듈), vertexai(인증 모드 복잡),
@@ -115,7 +166,15 @@ const EMBEDDING_SOURCES = {
     chutes:       { label: 'Chutes', secretKey: SECRET_KEYS.CHUTES, modelFromRequest: true, defaultModel: 'chutes-qwen-qwen3-embedding-8b' },
 };
 
-const CONVERT_MAX_TOKENS = 4096; // 프로필 경로(sendRequest)의 응답 상한 — 현재 연결 경로(generateRaw)는 기존처럼 현재 설정을 따른다
+// 설정 숫자칸 범위 — UI(min/max)와 읽기 쪽 클램프가 같은 값을 써야 한다 (UI만 막으면 수동 설정 파일 편집을 못 막는다)
+const SLICE_TOKENS_MIN = 2000;
+const SLICE_TOKENS_MAX = 60000;
+const CONVERT_MAX_TOKENS_MIN = 1024;
+const CONVERT_MAX_TOKENS_MAX = 65536;
+const DEFAULT_CONVERT_MAX_TOKENS = 16384; // 구 v0.6.4는 4096 고정 — 18,000토큰 슬라이스의 사건 다발을 담기엔 터무니없이 짧았다
+const INCIDENT_TOKENS_MIN = 100;
+const INCIDENT_TOKENS_MAX = 4000;
+const DEFAULT_INCIDENT_MAX_TOKENS = 500;
 
 const defaultSettings = Object.freeze({
     enabled: false,
@@ -127,7 +186,41 @@ const defaultSettings = Object.freeze({
     embeddingModel: '',        // 빈 값 = 소스별 기본 모델
     embeddingDirty: false,     // 임베딩 설정 변경 후 재색인 전 = true (경고 표시)
     convertProfileId: '',      // 빈 값 = 현재 연결 그대로 // 변환·숨김에서 제외할 최근 메시지 수 — 직전 장면은 원문으로 남아야 한다
+    // ── v0.7.0 신규 ──
+    sliceTokens: DEFAULT_SLICE_TOKENS,          // 슬라이스당 전사 토큰 상한
+    convertMaxTokens: DEFAULT_CONVERT_MAX_TOKENS, // 변환 응답 최대 토큰 (프로필 경로에만 직접 먹임)
+    incidentMaxTokens: DEFAULT_INCIDENT_MAX_TOKENS, // 사건 1건당 토큰 상한 (프롬프트에 주입)
+    queryTopK: DEFAULT_TOP_K,                   // 벡터 회수 후보 수
+    convertStyle: '',                           // 빈 값 = DEFAULT_CONVERT_STYLE 사용
 });
+
+/** 설정 숫자 방어 — 설정 파일이 손으로 망가졌어도 파이프라인은 돌아가야 한다 */
+function clampSetting(value, min, max, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function getSliceTokens() {
+    return clampSetting(getSettings().sliceTokens, SLICE_TOKENS_MIN, SLICE_TOKENS_MAX, DEFAULT_SLICE_TOKENS);
+}
+
+function getConvertMaxTokens() {
+    return clampSetting(getSettings().convertMaxTokens, CONVERT_MAX_TOKENS_MIN, CONVERT_MAX_TOKENS_MAX, DEFAULT_CONVERT_MAX_TOKENS);
+}
+
+function getIncidentMaxTokens() {
+    return clampSetting(getSettings().incidentMaxTokens, INCIDENT_TOKENS_MIN, INCIDENT_TOKENS_MAX, DEFAULT_INCIDENT_MAX_TOKENS);
+}
+
+function getQueryTopK() {
+    return clampSetting(getSettings().queryTopK, TOP_K_MIN, TOP_K_MAX, DEFAULT_TOP_K);
+}
+
+/** 비어 두면 기본 스타일 — "비우면 기본값"이 복원 버튼과 같은 의미가 되게 한다 */
+function getConvertStyle() {
+    return String(getSettings().convertStyle || '').trim() || DEFAULT_CONVERT_STYLE;
+}
 
 function getSettings() {
     if (!extension_settings[MODULE]) {
@@ -565,7 +658,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         for (const world of worlds) {
             let metadata;
             try {
-                ({ metadata } = await vectorQuery(world, queryText, QUERY_TOP_K));
+                ({ metadata } = await vectorQuery(world, queryText, getQueryTopK()));
             } catch (error) {
                 console.log(`${LOG} '${world}' 회수 실패(색인 안 됨?) — 이 로어북만 건너뜀: ${error?.message ?? error}`);
                 continue;
@@ -747,13 +840,17 @@ async function indexLorebook() {
 
 // ── 챗 → 로어북 변환 파이프라인 (v0.3) ─────────────────────────────────
 
-/** 메시지의 날짜(YYYY-MM-DD). ST send_date 포맷이 제각각이라 timestampToMoment(utils.js:1079) 사용 */
-function messageDay(message) {
+/**
+ * 메시지의 raw moment. ST send_date 포맷이 제각각이라 timestampToMoment(utils.js:1079) 사용.
+ * v0.7.0에서 messageDay(문자열 날짜)를 걷어냈다 — 장면 경계는 날짜가 바뀌었나가 아니라
+ * 실제 시간이 얼마나 벌어졌나로 판정하고, 실제 날짜 자체는 전사에 넣지 않기 때문이다.
+ */
+function messageMoment(message) {
     try {
         const m = timestampToMoment(message?.send_date);
-        return m?.isValid?.() ? m.format('YYYY-MM-DD') : '';
+        return m?.isValid?.() ? m : null;
     } catch {
-        return '';
+        return null;
     }
 }
 
@@ -765,24 +862,29 @@ function collectFreshMessages(chat, startIndex, endIndex) {
         if (!m || m.is_system) continue;
         const mes = String(m.mes || '').trim();
         if (!mes) continue;
+        const mom = messageMoment(m);
         fresh.push({
             name: String(m.name || (m.is_user ? 'User' : 'Char')),
             mes,
-            day: messageDay(m),
+            day: mom?.format('YYYY-MM-DD') ?? '',
+            // raw 타임스탬프(ms)도 같이 든다 (v0.7.0) — 전사의 장면 경계는
+            // '날짜가 바뀜나'가 아니라 '몇 시간 비었나'로 가른다
+            ts: mom ? mom.valueOf() : null,
         });
     }
     return fresh;
 }
 
 /** 메시지들을 토큰 예산 단위 슬라이스로 분할 (메시지 경계 유지) */
-async function buildSlices(messages) {
+async function buildSlices(messages, sliceTokens) {
+    const budget = clampSetting(sliceTokens, SLICE_TOKENS_MIN, SLICE_TOKENS_MAX, DEFAULT_SLICE_TOKENS);
     const slices = [];
     let current = [];
     let currentTokens = 0;
     for (const m of messages) {
         const line = `${m.name}: ${m.mes}`;
         const tokens = await getTokenCountAsync(line);
-        if (current.length && currentTokens + tokens > SLICE_TOKEN_BUDGET) {
+        if (current.length && currentTokens + tokens > budget) {
             slices.push(current);
             current = [];
             currentTokens = 0;
@@ -796,17 +898,29 @@ async function buildSlices(messages) {
 
 /** 슬라이스 → 전사 텍스트. 날짜가 바뀌는 지점에 [Date: …] 마커 삽입 */
 function sliceToTranscript(slice) {
+    const gapMs = REAL_GAP_HOURS * 60 * 60 * 1000;
     const lines = [];
-    let lastDay = '';
+    let prevTs = null;
     for (const m of slice) {
-        if (m.day && m.day !== lastDay) {
+        if (prevTs !== null && m.ts !== null && (m.ts - prevTs) >= gapMs) {
             lines.push('');
-            lines.push(`[Date: ${m.day}]`);
-            lastDay = m.day;
+            lines.push('[--- scene break ---]');
         }
+        if (m.ts !== null) prevTs = m.ts;
         lines.push(m.line);
     }
     return lines.join('\n').trim();
+}
+
+/**
+ * 응답 끝줄이 문장으로 닫혔는지 — 잘림 휴리스틱(양쪽 경로 공통).
+ * 토큰 수 비교는 프로필 경로에서만 쓸 수 있다(현재 연결은 상한을 모른다) — 그래서 글자 모양으로도 한 번 더 본다.
+ */
+function looksTruncated(text) {
+    const lines = String(text || '').split('\n').map(s => s.trim()).filter(Boolean);
+    const last = lines[lines.length - 1];
+    if (!last) return false;
+    return !SENTENCE_END_RE.test(last);
 }
 
 /**
@@ -817,7 +931,9 @@ function sliceToTranscript(slice) {
 function parseConversionOutput(text) {
     const incidents = [];
     const coreLines = [];
-    const headerRe = /^#{2,4}\s*(\d{4}-\d{2}-\d{2})\s*[—–:\-]?\s*(.*)$/;
+    // 날짜 뒤의 `#3` 같은 번호를 선택적으로 허용한다 (v0.7.0) — 프롬프트로 금지했지만
+    // 모델이 붙이면 헤더 자체가 매칭 실패해 사건이 통째로 날아간다. 번호는 읽고 버리고 코드가 다시 부여한다.
+    const headerRe = /^#{2,4}\s*(\d{4}-\d{2}-\d{2})(?:\s*#\s*\d+)?\s*[—–:\-]?\s*(.*)$/;
     const coreRe = /^#{2,4}\s*\**\s*CORE\s+STATE\b/i;
     const keywordRe = /^\s*\**\s*Keywords?\s*:\s*(.+?)\**\s*$/i;
     let current = null;
@@ -870,13 +986,55 @@ function findCoreEntry(worldData) {
 }
 
 /**
+ * 해당 작중 날짜로 이미 저장된 항목 수 (v0.7.0 에피소드 번호용).
+ * 코어 항목은 날짜 개념이 없으므로 제외. ⚠ 새 항목을 worldData에 넣기 **전**에 세야 한다.
+ */
+function countExistingForDate(worldData, date) {
+    if (!date) return 0;
+    let n = 0;
+    for (const e of Object.values(worldData?.entries ?? {})) {
+        if (e.comment === CORE_COMMENT) continue;
+        if (String(e.comment ?? '').includes(date)) n++;
+    }
+    return n;
+}
+
+/** 로어북 comment에 박힌 날짜 중 가장 늦은 것 — 앛커 폴백 2단계 */
+function latestDateInWorld(worldData) {
+    let latest = '';
+    for (const e of Object.values(worldData?.entries ?? {})) {
+        if (e.comment === CORE_COMMENT) continue;
+        for (const d of String(e.comment ?? '').match(/\d{4}-\d{2}-\d{2}/g) ?? []) {
+            if (d > latest) latest = d; // YYYY-MM-DD는 사전순 = 시간순
+        }
+    }
+    return latest;
+}
+
+/**
+ * 작중 날짜 앛커 확보 (v0.7.0).
+ * ① 이 채팅에 저장된 앛커 → ② 대상 로어북의 가장 늦은 날짜 → ③ 변환 대상 첫 메시지의 실제 날짜.
+ * ③가 유일하게 실제 날짜를 쓰는 지점이다 — 첫 변환엔 기준점이 아무데에도 없으니까.
+ */
+function resolveStoryAnchor(ctx, worldData, fresh) {
+    const saved = String(ctx?.chatMetadata?.[STORY_ANCHOR_META_KEY] ?? '').trim();
+    if (saved) return saved;
+    const fromWorld = latestDateInWorld(worldData);
+    if (fromWorld) return fromWorld;
+    return fresh.find(m => m.day)?.day ?? '';
+}
+
+/**
  * 변환용 생성 1회 — 프로필 지정 시 ConnectionManagerRequestService(shared.js:388), 아니면 현재 연결(generateRaw).
  * 프로필 실패 시 폴백하지 않는다 — 유저가 고른 프로필을 조용히 비싼 현재 연결로 바꾸는 건 배신이다.
  */
-async function generateConversion(ctx, userPrompt) {
+async function generateConversion(ctx, systemPrompt, userPrompt) {
     const settings = getSettings();
     if (!settings.convertProfileId) {
-        return await ctx.generateRaw({ prompt: userPrompt, systemPrompt: CONVERT_PROMPT });
+        // 현재 연결 경로는 ST의 응답 최대 토큰 설정을 그대로 따른다.
+        // generateRaw에 상한을 넘기지 않기로 했고(현이 결정, v0.7.0), 대신 패널과 경고로 알린다.
+        const text = await ctx.generateRaw({ prompt: userPrompt, systemPrompt });
+        return { text: String(text ?? ''), viaProfile: false };
     }
     let profileName = settings.convertProfileId;
     try {
@@ -886,16 +1044,38 @@ async function generateConversion(ctx, userPrompt) {
     const result = await ConnectionManagerRequestService.sendRequest(
         settings.convertProfileId,
         [
-            { role: 'system', content: CONVERT_PROMPT },
+            { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
         ],
-        CONVERT_MAX_TOKENS,
+        getConvertMaxTokens(),
     );
     const text = typeof result === 'string' ? result : String(result?.content ?? '');
     if (!text.trim()) {
         throw new Error(`변환 프로필(${profileName})의 응답이 비어 있어요`);
     }
-    return text;
+    return { text, viaProfile: true };
+}
+
+/**
+ * 잘림 감지 2종을 돌려 경고 배열에 모은다 (v0.7.0).
+ * (a) 프로필 경로: 응답 토큰이 상한의 TRUNCATION_RATIO 이상 → 상한에 박은 것으로 본다.
+ * (b) 공통: 끝줄이 문장으로 안 닫혔 있다.
+ * 경고만 하고 결과는 버리지 않는다 — API 호출 N번을 날리는 게 더 비싸다.
+ */
+async function collectTruncationWarnings(warnings, text, viaProfile, maxTokens, label) {
+    if (viaProfile) {
+        try {
+            const used = await getTokenCountAsync(String(text ?? ''));
+            if (used >= Math.floor(maxTokens * TRUNCATION_RATIO)) {
+                warnings.push(`${label}: 응답이 ${used.toLocaleString()}토큰으로 상한(${maxTokens.toLocaleString()})에 닿았어요 — 뒷부분이 잘렸을 수 있어요`);
+            }
+        } catch (error) {
+            console.warn(`${LOG} ${label} 응답 토큰 계산 실패 (잘림 감지 (a) 건너뜀): ${error?.message ?? error}`);
+        }
+    }
+    if (looksTruncated(text)) {
+        warnings.push(`${label}: 응답이 문장 중간에서 끓겼어요 — 응답 최대 토큰을 늘려 보세요`);
+    }
 }
 
 /**
@@ -919,7 +1099,14 @@ function openWorldEditor(world) {
 function getConvertProfileBadge() {
     const settings = getSettings();
     if (!settings.convertProfileId) {
-        return { icon: 'fa-plug', text: '현재 연결 그대로', warn: false };
+        // 이 경로는 generateRaw라 응답 상한을 우리가 못 정한다(호출부를 건드리지 않기로 한 결정, v0.7.0).
+        // 그래서 조용히 잘리는 대신 배지에서 먼저 경고한다.
+        return {
+            icon: 'fa-plug',
+            text: '현재 연결 그대로',
+            note: 'ST 응답 최대 토큰 설정을 따라요 — 낮으면 잘려요',
+            warn: true,
+        };
     }
     try {
         const profile = ConnectionManagerRequestService.getProfile(settings.convertProfileId);
@@ -934,10 +1121,30 @@ function getConvertProfileBadge() {
 /** 변환 프로필 배지를 패널에 그린다 (변환 버튼 바로 위) */
 function renderConvertProfileBadge($panel) {
     const badge = getConvertProfileBadge();
-    $panel.find('#jev_panel_convert_profile').empty()
+    const $badge = $panel.find('#jev_panel_convert_profile').empty()
         .toggleClass('jev-badge-warn', badge.warn)
         .append($(`<i class="fa-solid ${badge.icon}">`))
         .append($('<span>').text(badge.text));
+    if (badge.note) {
+        $badge.append($('<span class="jev-badge-note">').text(badge.note));
+    }
+}
+
+/**
+ * 직전 변환 경고 렌더 (v0.7.0) — 토스트는 사라지지만 잘린 요약은 로어북에 남는다.
+ * 경고가 없으면 영역 자체를 숨긴다 — 빈 박스가 상시 떠 있으면 경고가 경고로 안 보인다.
+ */
+function renderPanelWarnings($panel) {
+    const $section = $panel.find('#jev_panel_warnings');
+    const $list = $panel.find('#jev_panel_warnings_list').empty();
+    if (!lastConvertWarnings.length) {
+        $section.hide();
+        return;
+    }
+    for (const w of lastConvertWarnings) {
+        $list.append($('<div class="jev-warn-line">').text(`⚠ ${w}`));
+    }
+    $section.show();
 }
 
 /** 변환 프로필 표시명 — 패널·상태줄용 */
@@ -955,9 +1162,14 @@ function getConvertProfileLabel() {
  * 챗 → 로어북 변환 본체.
  * - 범위: chat_metadata[CONVERT_META_KEY] ~ (끝 - keepRecent). 최근 N개는 원문 맥락으로 보존 (첫 실행은 그 앞 전체)
  * - 생성: 메인 API generateRaw (Generate 파이프라인 밖 — 인터셉터·WI스캔 안 탐, script.js:4063 검증)
- * - 코어: 슬라이스마다 [Previous core state]를 주고 갱신 → 마지막 코어를 constant 항목으로 upsert (ST 네이티브 매턴 주입)
  * - 저장: createWorldInfoEntry(uid 자동 할당) → saveWorldInfo → 변환 지점 saveMetadata → 자동 색인 → 성공 후에만 원본 구간 숨김
  * - 실패 시: 항목·변환 지점 미저장·숨김 없음 (전량 성공 후에만 쓴다) → 재실행하면 같은 범위 재시도
+ *
+ * v0.7.0 개편:
+ * - 코어 갱신을 슬라이스 루프에서 떼어내 맨 끝 1회로 몰았다. 중간 슬라이스의 코어는 어차피 다음 슬라이스가
+ *   덮어써서 버려졌는데, 그동안 사건 출력 예산만 갉아먹고 있었다. 코어 입력은 전사 원문이 아니라 사건 요약본이다.
+ * - 잘림 의심은 warnings[]에 모으고, 하나라도 있으면 초록불(success)을 띄우지 않는다.
+ *   단 이미 뽑은 사건은 버리지 않는다 — API 호출 N번을 날리는 게 더 나쁘다.
  */
 async function convertChatToLorebook(setStatus) {
     if (conversionInProgress) {
@@ -987,57 +1199,110 @@ async function convertChatToLorebook(setStatus) {
 
     conversionInProgress = true;
     const t0 = performance.now();
+    const warnings = [];   // 잘림 의심·형식 불일치·코어 실패 — 완료 토스트 색을 여기서 정한다
+    let coreFailed = false;
+    lastConvertWarnings = []; // 이번 실행 것으로 갈아끼운다 (지난번 경고가 남아 겁주면 안 된다)
     try {
-        // 0. 로어북 선로드 — 이전 코어 상태를 읽어 프롬프트에 넣는다 (누적 서술이 아니라 스냅샷 갱신)
+        // 0. 로어북 선로드 — 이전 코어 상태와 작중 날짜 앵커를 여기서 확보한다
         const worldData = await loadWorldInfo(world);
         if (!worldData?.entries) {
             throw new Error(`로어북 '${world}' 로드 실패`);
         }
         let coreState = String(findCoreEntry(worldData)?.content ?? '').trim();
+        const anchor = resolveStoryAnchor(ctx, worldData, fresh);
 
         setStatus('슬라이스 계산 중…');
-        const slices = await buildSlices(fresh);
-        console.log(`${LOG} 변환 시작 — 대상='${world}' 메시지 ${fresh.length}건(인덱스 ${startIndex}~${endIndex}, 최근 ${keepRecent}개 보존) → 슬라이스 ${slices.length}개 / 이전 코어 ${coreState ? '있음' : '없음'}`);
+        const sliceTokens = getSliceTokens();
+        const maxTokens = getConvertMaxTokens();
+        const slices = await buildSlices(fresh, sliceTokens);
+        const incidentsPrompt = buildIncidentsPrompt(getConvertStyle(), getIncidentMaxTokens(), anchor);
+        console.log(`${LOG} 변환 시작 — 대상='${world}' 메시지 ${fresh.length}건(인덱스 ${startIndex}~${endIndex}, 최근 ${keepRecent}개 보존) → 슬라이스 ${slices.length}개(${sliceTokens}토큰 단위) / 작중 앵커 '${anchor || '없음'}' / 이전 코어 ${coreState ? '있음' : '없음'}`);
 
-        // 1. 슬라이스별 메인 API 생성 (순차 — 코어 상태를 다음 슬라이스로 이어받는다)
+        // 1. 슬라이스별 사건 추출 — 이 호출들은 코어를 전혀 다루지 않는다 (출력 예산 전액을 사건에 쓴다)
         const incidents = [];
         for (let i = 0; i < slices.length; i++) {
+            const label = `슬라이스 ${i + 1}/${slices.length}`;
             setStatus(`요약 생성 중… ${i + 1}/${slices.length} (${getConvertProfileLabel()})`);
             const transcript = sliceToTranscript(slices[i]);
-            const prompt = `[Previous core state]\n${coreState || '(none)'}\n\n[Transcript]\n${transcript}`;
-            const raw = await generateConversion(ctx, prompt);
+            const prompt = `[Anchor: ${anchor || 'unknown'}]\n\n[Transcript]\n${transcript}`;
+            const { text: raw, viaProfile } = await generateConversion(ctx, incidentsPrompt, prompt);
+            await collectTruncationWarnings(warnings, raw, viaProfile, maxTokens, label);
             const parsed = parseConversionOutput(raw);
             if (!parsed.incidents.length) {
-                console.warn(`${LOG} 슬라이스 ${i + 1}/${slices.length} — 출력 ${String(raw ?? '').length}자에서 사건 헤더 0건 (형식 불일치)`);
+                warnings.push(`${label}: 출력 ${String(raw ?? '').length}자에서 사건 헤더를 하나도 못 찾았어요 (형식 불일치)`);
+                console.warn(`${LOG} ${label} — 사건 헤더 0건 (형식 불일치)`);
             } else {
-                console.log(`${LOG} 슬라이스 ${i + 1}/${slices.length} — 사건 ${parsed.incidents.length}건 파싱 / 코어 ${parsed.core ? '갱신' : '유지'}`);
+                console.log(`${LOG} ${label} — 사건 ${parsed.incidents.length}건 파싱`);
             }
             incidents.push(...parsed.incidents);
-            if (parsed.core) coreState = parsed.core; // 마지막 유효 코어가 최종 스냅샷
         }
         if (!incidents.length) {
             throw new Error('출력에서 사건 헤더(### YYYY-MM-DD — 제목)를 하나도 찾지 못했어요 — 항목과 변환 지점은 저장하지 않았어요');
         }
 
+        // 1b. 코어 갱신 1회 — 입력은 전사 원문이 아니라 이번에 뽑은 사건 요약본 전체.
+        //     형식이 깨지면 1회만 재시도하고, 그래도 안 되면 코어만 손대지 않고 진행한다 (사건은 살린다).
+        setStatus(`코어 메모리 갱신 중… (${getConvertProfileLabel()})`);
+        const digest = incidents.map(inc => `### ${inc.date} — ${inc.title}\n${inc.body}`).join('\n\n');
+        const corePrompt = `[Previous core state]\n${coreState || '(none)'}\n\n[New incidents]\n${digest}`;
+        let coreUpdated = false;
+        let coreFailReason = '';
+        for (let attempt = 1; attempt <= 2 && !coreUpdated; attempt++) {
+            const label = attempt === 1 ? '코어 갱신' : '코어 갱신(재시도)';
+            try {
+                const { text: raw, viaProfile } = await generateConversion(ctx, CORE_PROMPT, corePrompt);
+                await collectTruncationWarnings(warnings, raw, viaProfile, maxTokens, label);
+                const parsed = parseConversionOutput(raw);
+                if (parsed.core) {
+                    coreState = parsed.core;
+                    coreUpdated = true;
+                } else {
+                    coreFailReason = `${label}: 응답에 ### CORE STATE 섹션이 없거나 본문이 비었어요`;
+                    console.warn(`${LOG} ${coreFailReason}`);
+                }
+            } catch (error) {
+                coreFailReason = `${label}: ${error?.message ?? error}`;
+                console.warn(`${LOG} ${coreFailReason}`);
+            }
+        }
+        if (!coreUpdated) {
+            coreFailed = true;
+            warnings.push(`코어 메모리를 갱신하지 못했어요 (사건은 그대로 저장했어요) — ${coreFailReason || '사유 미상'}`);
+        }
+
         // 2. 로어북 항목 추가 — createWorldInfoEntry가 uid를 충돌 없이 할당 (world-info.js:4057)
         setStatus(`로어북 항목 생성 중… ${incidents.length}건`);
+        // 에피소드 번호는 코드가 붙인다 — 모델은 분할만 한다.
+        // 기존 개수는 반드시 새 항목을 넣기 '전'에 세어둔다 (넣으면서 세면 자기 자신을 세게 된다).
+        const existingByDate = new Map();
+        for (const inc of incidents) {
+            if (!existingByDate.has(inc.date)) {
+                existingByDate.set(inc.date, countExistingForDate(worldData, inc.date));
+            }
+        }
+        const batchByDate = new Map();
         for (const inc of incidents) {
             const entry = createWorldInfoEntry(world, worldData);
             if (!entry) {
                 throw new Error('로어북 항목 uid 할당 실패');
             }
+            const seen = batchByDate.get(inc.date) ?? 0;
+            batchByDate.set(inc.date, seen + 1);
+            const n = (existingByDate.get(inc.date) ?? 0) + seen + 1;
             // 키워드 발동은 쓰지 않는다 — 발동 경로는 Jev(FORCE_ACTIVATE) 단일.
             // 키를 달면 ST 재귀 스캔이 본문의 이름·날짜를 물고 연쇄 발동하는데,
             // world_info_max_recursion_steps=0이면 제동이 아예 안 걸려 예산 상한까지 퍼붓는다. (2026-09-20)
             entry.key = [];
-            entry.comment = `${inc.title} · ${inc.date}`;
+            // 1번째엔 번호를 안 붙인다 — 하루에 사건이 하나뿐인 날이 대부분이라 '#1'은 소음이다
+            entry.comment = `${inc.title} · ${inc.date}${n > 1 ? ` #${n}` : ''}`;
             entry.content = inc.body;
             entry.constant = false;
             entry.disable = false;
         }
 
         // 2b. 코어 메모리 upsert — constant:true = ST가 매턴 네이티브 주입 (Jev 판정·색인 밖 — 설계 의도)
-        if (coreState) {
+        //     갱신에 실패했으면 기존 코어 항목은 건드리지 않는다 (덮어쓸 새 값이 없다).
+        if (coreState && coreUpdated) {
             const coreTokens = await getTokenCountAsync(coreState);
             if (coreTokens > CORE_TOKEN_LIMIT) {
                 console.warn(`${LOG} 코어 스냅샷 ${coreTokens}토큰 — 상한 ${CORE_TOKEN_LIMIT} 초과 (자르지 않고 그대로 저장, 다음 변환에서 재압축됨)`);
@@ -1055,14 +1320,17 @@ async function convertChatToLorebook(setStatus) {
             coreEntry.disable = false;
             console.log(`${LOG} 코어 메모리 upsert — ${coreTokens}토큰 (constant, 매턴 네이티브 주입)`);
         } else {
-            console.warn(`${LOG} 출력에 CORE STATE 섹션 없음 — 코어 항목 미갱신`);
+            console.warn(`${LOG} 코어 미갱신 — 기존 코어 항목을 그대로 둔다`);
         }
 
         await saveWorldInfo(world, worldData, true);
         reloadEditor(world); // 에디터에 이 로어북이 열려 있으면 실시간 갱신 (world-info.js:1040, 강제 오픈 없음)
 
-        // 3. 변환 지점 기록 (chat_metadata — 이 채팅에만 귀속)
+        // 3. 변환 지점 + 작중 날짜 앵커 기록 (chat_metadata — 이 채팅에만 귀속)
+        //    앵커 = 마지막 사건의 날짜. 다음 변환이 여기서부터 경과를 센다.
         ctx.chatMetadata[CONVERT_META_KEY] = endIndex;
+        const lastDate = incidents[incidents.length - 1]?.date;
+        if (lastDate) ctx.chatMetadata[STORY_ANCHOR_META_KEY] = lastDate;
         await ctx.saveMetadata();
 
         // 4. 자동 색인 (constant 제외)
@@ -1076,11 +1344,29 @@ async function convertChatToLorebook(setStatus) {
         const hiddenCount = endIndex - startIndex;
 
         const ms = Math.round(performance.now() - t0);
-        setStatus(`완료: 사건 ${incidents.length}건 추가 · 코어 ${coreState ? '갱신' : '미갱신'} · ${indexed}개 색인 · 메시지 ${hiddenCount}개 변환·숨김, 최근 ${keepRecent}개 유지 (${ms}ms)`);
-        toastr.success(`변환을 마쳤어요: 사건 ${incidents.length}건 · 메시지 ${hiddenCount}개 숨김 · 최근 ${keepRecent}개는 원문 유지 — ${world}. 여기를 누르면 에디터에서 바로 확인할 수 있어요.`, 'Jev Lorebook', { onclick: () => openWorldEditor(world), timeOut: 10000 });
-        console.log(`${LOG} 변환 완료 — 사건 ${incidents.length}건 / 변환 지점 ${startIndex}→${endIndex} / 숨김 ${hiddenCount}개 / ${ms}ms`);
+        lastConvertWarnings = warnings.slice();
+        const summary = `사건 ${incidents.length}건 추가 · 코어 ${coreUpdated ? '갱신' : '미갱신'} · 앵커 ${lastDate || '유지'} · ${indexed}개 색인 · 메시지 ${hiddenCount}개 변환·숨김, 최근 ${keepRecent}개 유지 (${ms}ms)`;
+        const toastBody = `변환을 마쳤어요: 사건 ${incidents.length}건 · 메시지 ${hiddenCount}개 숨김 · 최근 ${keepRecent}개는 원문 유지 — ${world}.`;
+        const toastOptions = { onclick: () => openWorldEditor(world), timeOut: 10000 };
+
+        if (!warnings.length) {
+            setStatus(`완료: ${summary}`);
+            toastr.success(`${toastBody} 여기를 누르면 에디터에서 바로 확인할 수 있어요.`, 'Jev Lorebook', toastOptions);
+        } else {
+            // 경고가 하나라도 있으면 초록불을 띄우지 않는다 — "다 잘 됐구나"로 읽히면 잘린 요약이 그대로 굳는다
+            setStatus(`완료(경고 ${warnings.length}건): ${summary} — ${warnings.join(' / ')}`);
+            const warnBody = `${toastBody}\n⚠ 확인할 게 ${warnings.length}건 있어요: ${warnings.join(' / ')}`;
+            if (coreFailed) {
+                toastr.error(warnBody, 'Jev Lorebook', { ...toastOptions, timeOut: 20000 });
+            } else {
+                toastr.warning(warnBody, 'Jev Lorebook', { ...toastOptions, timeOut: 20000 });
+            }
+        }
+        console.log(`${LOG} 변환 완료 — 사건 ${incidents.length}건 / 변환 지점 ${startIndex}→${endIndex} / 숨김 ${hiddenCount}개 / 경고 ${warnings.length}건 / ${ms}ms`);
     } catch (error) {
         console.error(`${LOG} 변환 실패`, error);
+        warnings.push(`변환 실패: ${error?.message ?? error}`);
+        lastConvertWarnings = warnings.slice();
         setStatus(`실패했어요: ${error?.message ?? error}`);
         toastr.error(`변환에 실패했어요: ${error?.message ?? error}`, 'Jev Lorebook');
     } finally {
@@ -1559,6 +1845,7 @@ async function renderPanelChunks($panel) {
 /** 패널 전체 갱신 */
 async function refreshPanel($panel) {
     renderPanelSummary($panel);
+    renderPanelWarnings($panel);
     renderPanelJudgment($panel);
     await renderPanelChunks($panel);
 }
@@ -1576,6 +1863,7 @@ async function openDetailPanel() {
         try {
             await convertChatToLorebook(setConvertStatus);
             renderPanelSummary($panel);
+            renderPanelWarnings($panel);
             await renderPanelChunks($panel);
         } finally {
             $button.removeClass('disabled');
@@ -1688,6 +1976,33 @@ function populateConvertProfiles() {
     }
 }
 
+/**
+ * topK 슬라이더 옆 '전체 N개' 채우기 (v0.7.0).
+ * "30이 많은 건가 적은 건가"는 로어북 크기를 같이 봐야 판단된다.
+ * 로어북 로드가 있어 비동기 — 렌더를 막지 않는다 (fillStackTokens과 같은 패턴).
+ */
+async function fillTopKTotal() {
+    const $total = $('#jev_lorebook_topk_total');
+    if (!$total.length) return;
+    const worlds = getTargetWorlds();
+    if (!worlds.length) {
+        $total.text(' / 대상 로어북 없음');
+        return;
+    }
+    try {
+        let total = 0;
+        for (const world of worlds) {
+            const worldData = await loadWorldInfo(world);
+            total += Object.values(worldData?.entries ?? {})
+                .filter(e => !e.disable && String(e.content ?? '').trim()).length;
+        }
+        $total.text(` / 전체 ${total}개`);
+    } catch (error) {
+        console.log(`${LOG} topK 전체 항목 수 집계 실패(표시만 생략): ${error?.message ?? error}`);
+        $total.text('');
+    }
+}
+
 function populateWorldSelect() {
     const settings = getSettings();
     const $select = $('#jev_lorebook_world');
@@ -1722,6 +2037,7 @@ jQuery(async () => {
     $('#jev_lorebook_world').on('change', function () {
         settings.world = String($(this).val());
         saveSettingsDebounced();
+        void fillTopKTotal(); // 대상이 바뀌면 '전체 N개'도 따라가야 한다
     });
 
     $('#jev_lorebook_keep_recent').val(settings.keepRecent).on('input', function () {
@@ -1731,6 +2047,47 @@ jQuery(async () => {
     });
 
     $('#jev_lorebook_index').on('click', indexLorebook);
+
+    // ── v0.7.0 신규 설정 ──
+    // topK 슬라이더 — 옆 숫자는 input에서 즉시 따라간다(놓을 때까지 몰라야 하면 조절을 못 한다)
+    $('#jev_lorebook_topk').val(getQueryTopK()).on('input', function () {
+        const value = clampSetting($(this).val(), TOP_K_MIN, TOP_K_MAX, DEFAULT_TOP_K);
+        settings.queryTopK = value;
+        $('#jev_lorebook_topk_value').text(String(value));
+        saveSettingsDebounced();
+    });
+    $('#jev_lorebook_topk_value').text(String(getQueryTopK()));
+    void fillTopKTotal();
+
+    $('#jev_lorebook_slice_tokens').val(getSliceTokens()).on('input', function () {
+        settings.sliceTokens = clampSetting($(this).val(), SLICE_TOKENS_MIN, SLICE_TOKENS_MAX, DEFAULT_SLICE_TOKENS);
+        saveSettingsDebounced();
+    });
+
+    $('#jev_lorebook_convert_max_tokens').val(getConvertMaxTokens()).on('input', function () {
+        settings.convertMaxTokens = clampSetting($(this).val(), CONVERT_MAX_TOKENS_MIN, CONVERT_MAX_TOKENS_MAX, DEFAULT_CONVERT_MAX_TOKENS);
+        saveSettingsDebounced();
+    });
+
+    $('#jev_lorebook_incident_max_tokens').val(getIncidentMaxTokens()).on('input', function () {
+        settings.incidentMaxTokens = clampSetting($(this).val(), INCIDENT_TOKENS_MIN, INCIDENT_TOKENS_MAX, DEFAULT_INCIDENT_MAX_TOKENS);
+        saveSettingsDebounced();
+    });
+
+    // 스타일 지시문 — 빈 값이 곷 기본값이라 placeholder에도 같은 글을 넣는다
+    $('#jev_lorebook_convert_style')
+        .attr('placeholder', DEFAULT_CONVERT_STYLE)
+        .val(String(settings.convertStyle || ''))
+        .on('input', function () {
+            settings.convertStyle = String($(this).val());
+            saveSettingsDebounced();
+        });
+    $('#jev_lorebook_style_reset').on('click', function () {
+        settings.convertStyle = '';
+        $('#jev_lorebook_convert_style').val('');
+        saveSettingsDebounced();
+        toastr.info('변환 스타일 지시문을 기본값으로 되돌렸어요.', 'Jev Lorebook');
+    });
 
     // 임베딩 소스/모델 (v0.5) — 변경 시 기존 색인과 벡터 차원이 어긋나므로 재색인 경고
     populateEmbeddingSourceSelect();

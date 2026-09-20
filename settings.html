@@ -34,12 +34,40 @@
             <small class="jev-set-help">비우면 기본 모델. 바꾸면 [색인] 다시.</small>
             <small id="jev_lorebook_reindex_warning" class="jev-reindex-warning" style="display: none;">⚠ 임베딩 설정이 바뀌어 재색인이 필요해요 — [색인]을 눌러 주세요.</small>
 
+            <label for="jev_lorebook_topk">회수 후보 수</label>
+            <div class="jev-range-row">
+                <input id="jev_lorebook_topk" type="range" min="20" max="50" step="5" />
+                <span class="jev-range-value"><b id="jev_lorebook_topk_value">30</b><span id="jev_lorebook_topk_total" class="jev-range-total"></span></span>
+            </div>
+            <small class="jev-set-help">한 번에 판정대에 올릴 후보 수예요. 로어북이 크면 올려 주세요.</small>
+
             <div class="jev-set-group">챗 → 로어북 변환</div>
 
             <div id="jev_lorebook_profile_row" class="jev-profile-row">
                 <label for="jev_lorebook_convert_profile">연결 프로필</label>
                 <select id="jev_lorebook_convert_profile" class="text_pole"></select>
             </div>
+            <small class="jev-set-help">긴 전사를 한 번에 요약해요. 출력 길이에 여유 있는 고성능 모델을 권해요. 추론(thinking) 모델은 사고 과정도 출력 예산을 쓰니 응답 최대 토큰을 넉넉히 잡아 주세요.</small>
+
+            <label for="jev_lorebook_slice_tokens">슬라이스 토큰</label>
+            <input id="jev_lorebook_slice_tokens" class="text_pole" type="number" min="2000" max="60000" step="1000" />
+            <small class="jev-set-help">한 번에 요약할 대화 분량이에요. (기본 18,000)</small>
+
+            <label for="jev_lorebook_convert_max_tokens">응답 최대 토큰</label>
+            <input id="jev_lorebook_convert_max_tokens" class="text_pole" type="number" min="1024" max="65536" step="1024" />
+            <small class="jev-set-help">너무 낮으면 요약이 잘려요. (기본 16,384)</small>
+
+            <label for="jev_lorebook_incident_max_tokens">사건당 토큰 상한</label>
+            <input id="jev_lorebook_incident_max_tokens" class="text_pole" type="number" min="100" max="4000" step="50" />
+            <small class="jev-set-help">사건 하나를 이 길이 안에서 써요. (기본 500)</small>
+
+            <label for="jev_lorebook_convert_style">변환 스타일 지시문</label>
+            <textarea id="jev_lorebook_convert_style" class="text_pole textarea_compact" rows="5"></textarea>
+            <div id="jev_lorebook_style_reset" class="menu_button menu_button_icon" title="기본 스타일 지시문으로 되돌려요">
+                <i class="fa-solid fa-rotate-left"></i>
+                <span>기본값 복원</span>
+            </div>
+            <small class="jev-set-help">출력 형식(날짜 헤더·코어 메모리 구조)은 고정이에요 — 문체와 분량만 바꿔 주세요.</small>
 
             <label for="jev_lorebook_keep_recent">최근 메시지 보존</label>
             <input id="jev_lorebook_keep_recent" class="text_pole" type="number" min="0" max="200" step="1" />

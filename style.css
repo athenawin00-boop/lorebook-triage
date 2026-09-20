@@ -363,3 +363,52 @@
 
 .jev-verdict-warm { color: var(--warning, #e5a50a); opacity: 1; }
 .jev-verdict-hot  { color: var(--warning, #e5a50a); opacity: 1; font-weight: 600; }
+
+/* ── v0.7.0 추가 ─────────────────────────────────── */
+
+/* topK 슬라이더 — 숫자와 '전체 N개'를 한 줄에 붙여야 "30이 많은 건가"가 읽힌다 */
+.jev-lorebook-settings .jev-range-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.jev-lorebook-settings .jev-range-row input[type="range"] {
+    flex: 1;
+    min-width: 0;
+}
+
+.jev-lorebook-settings .jev-range-value {
+    white-space: nowrap;
+    font-size: 0.92em;
+}
+
+.jev-lorebook-settings .jev-range-total {
+    opacity: 0.65;
+}
+
+.jev-lorebook-settings textarea#jev_lorebook_convert_style {
+    width: 100%;
+    resize: vertical;
+    font-family: inherit;
+}
+
+/* 변환 경고 박스 — 토스트는 몇 초 뒤 사라지지만 잘린 요약은 로어북에 남는다 */
+.jev-panel-warnbox {
+    border: 1px solid var(--warning, #e5a50a);
+    border-radius: 6px;
+    padding: 8px 10px;
+    background-color: rgba(229, 165, 10, 0.08);
+}
+
+.jev-warn-line {
+    color: var(--warning, #e5a50a);
+    font-size: 0.9em;
+    margin-top: 2px;
+}
+
+/* 배지 옆 경고 문구 — 배지 자체는 주의 스타일(jev-badge-warn)을 그대로 쓴다 */
+.jev-profile-badge .jev-badge-note {
+    opacity: 0.85;
+    font-size: 0.92em;
+}
