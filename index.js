@@ -1197,7 +1197,38 @@ function renderPanelSummary($panel) {
     $summary.append(row('변환 프로필', getConvertProfileLabel()));
     const keepRecent = Number.isFinite(Number(settings.keepRecent)) ? Math.max(0, Number(settings.keepRecent)) : defaultSettings.keepRecent;
     $summary.append(row('변환 대상', convertWorld || '없음'));
-    $summary.append(row('변환 지점', `${converted}/${chatLength} 메시지 (다음 변환: ${Math.max(0, chatLength - keepRecent - converted)}건, 최근 ${keepRecent}개 보존)`));
+    $summary.append(row('변환 지점', `${converted}/${chatLength} 메시지 (최근 ${keepRecent}개 보존)`));
+
+    // 미변환 적치량 — 토큰 집계는 비동기라 먼저 건수만 그리고 뒤에서 채운다
+    const pendingEnd = Math.max(converted, chatLength - keepRecent);
+    const pendingCount = Math.max(0, pendingEnd - converted);
+    const $pending = $('<span>').text(pendingCount ? `${pendingCount}건 · 토큰 세는 중…` : '없음 (새 메시지가 보존 버퍼 안에만 있어요)');
+    $summary.append($('<div class="jev-panel-row">')
+        .append($('<span class="jev-panel-label">').text('변환 대기'))
+        .append($pending));
+    if (pendingCount) {
+        void fillPendingTokens($pending, ctx.chat ?? [], converted, pendingEnd, keepRecent, chatLength);
+    }
+}
+
+/**
+ * 변환 대기 구간의 토큰을 세서 채운다. 패널 렌더를 막지 않게 비동기로 분리.
+ * 보존 버퍼(최근 N개)는 변환 대상이 아니라 따로 병기한다.
+ */
+async function fillPendingTokens($slot, chat, from, to, keepRecent, chatLength) {
+    try {
+        const body = chat.slice(from, to).map(m => String(m?.mes || '')).filter(Boolean).join('\n');
+        const pendingTokens = body ? await getTokenCountAsync(body) : 0;
+        const bufBody = keepRecent
+            ? chat.slice(Math.max(0, chatLength - keepRecent)).map(m => String(m?.mes || '')).filter(Boolean).join('\n')
+            : '';
+        const bufTokens = bufBody ? await getTokenCountAsync(bufBody) : 0;
+        const count = Math.max(0, to - from);
+        $slot.text(`${count}건 · ${pendingTokens.toLocaleString()}토큰`
+            + (keepRecent ? `  (보존 버퍼 ${keepRecent}개 = ${bufTokens.toLocaleString()}토큰, 변환 안 함)` : ''));
+    } catch (error) {
+        $slot.text(`${Math.max(0, to - from)}건 · 토큰 집계 실패: ${error?.message ?? error}`);
+    }
 }
 
 /** 직전 턴 판정 리포트 렌더 */
