@@ -695,6 +695,23 @@ function buildSceneExcerpt(chat) {
     return lines.join('\n').slice(-5000);
 }
 
+/**
+ * FORCE_ACTIVATE로 보낼 엔트리 (v0.9.3).
+ *
+ * ⚠ ST는 이 이벤트로 받은 객체 그자체를 활성 엔트리로 쓴다:
+ *   world-info.js:1025  externalActivations.set(key, entry)  <- 우리 객체 원본을 그대로 저장
+ *   world-info.js:4776  activatedNow.add(buffer.getExternallyActivated(entry))
+ *   world-info.js:5086  getRegexedString(entry.content, ...)
+ *   world-info.js:5088  content가 비면 'skipped adding to prompt due to empty content' 로 버려짐
+ *
+ * 즉 {world, uid}만 보내면 발동 로그는 찍히는데 프롬프트엔 아무것도 안 들어간다.
+ * v0.1~v0.9.2 내내 그 상태였다 - 판정만 돌고 주입은 0이었다.
+ * 패널의 Jev 행이 제목 'uid N' · 0tok으로 뜨던 게 그 증거다 (2026-09-20 스샷 제보).
+ */
+function buildForceEntry(a) {
+    return a.raw ? { ...a.raw, world: a.world, uid: a.uid } : { world: a.world, uid: a.uid };
+}
+
 // ── generate_interceptor ────────────────────────────────────────────────
 
 async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
@@ -731,7 +748,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
             if (lastJudgment.items.length) {
                 await eventSource.emit(
                     event_types.WORLDINFO_FORCE_ACTIVATE,
-                    lastJudgment.items.map(x => ({ world: x.world, uid: x.uid })),
+                    lastJudgment.items.map(buildForceEntry),
                 );
             }
             if (lastReport) {
@@ -761,6 +778,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
                     uid: Number(m.index),
                     text: String(m.text ?? entries[m.index].content ?? ''),
                     title: String(entries[m.index].comment || `uid ${m.index}`),
+                    raw: entries[m.index],   // v0.9.3 - FORCE_ACTIVATE에 원본 엔트리를 실어야 한다 (buildForceEntry 주석)
                 });
             }
         }
@@ -796,13 +814,13 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
             adopted.push({ ...item, tokens });
         }
 
-        lastJudgment = { key: cacheKey, items: adopted.map(a => ({ world: a.world, uid: a.uid })), ts: Date.now() };
+        lastJudgment = { key: cacheKey, items: adopted.map(a => ({ world: a.world, uid: a.uid, raw: a.raw })), ts: Date.now() };
 
         // 4. 주입
         if (adopted.length) {
             await eventSource.emit(
                 event_types.WORLDINFO_FORCE_ACTIVATE,
-                adopted.map(a => ({ world: a.world, uid: a.uid })),
+                adopted.map(buildForceEntry),
             );
         }
 
