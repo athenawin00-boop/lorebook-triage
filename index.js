@@ -45,6 +45,7 @@ const DEFAULT_TOP_K = 30;        // 벡터 회수 후보 수 기본값 — 20으
 const TOP_K_MIN = 20;
 const TOP_K_MAX = 50;
 const SCORE_FLOOR = 0.5;         // 최종 점수 하한. 대조실험 눈금: 0.74=빼면 모순 / 0.52=장면만 맞음 / 0.37=무관
+const MAX_ADOPTED = 3;          // Jev 채택 개수 상한 (v0.9.0, 고정 상수 — 설정 노출 안 함). budgetTokens·SCORE_FLOOR와 동시 적용, 먼저 걸리는 쪽이 이긴다
 const QUERY_USER_MESSAGES = 3;   // 검색 쿼리로 쓸 최근 유저 메시지 수
 const SCENE_MESSAGES = 6;        // Jev에 보여줄 최근 장면 메시지 수
 const INSERT_CHUNK = 20;         // 색인 시 insert 배치 크기
@@ -135,6 +136,14 @@ let lastJudgment = { key: 0, items: [], ts: 0 };
 let lastReport = null;
 /** 직전 인터셉터 에러 — 패널 표시용 */
 let lastError = null;
+/**
+ * 이번 턴 ST가 실제로 주입한 엔트리 (v0.9.0) — WORLD_INFO_ACTIVATED 구독 결과.
+ * world-info.js:902에서 isDryRun이 아닐 때만 emit되고, 인자는 활성화된 **전체** 엔트리 배열이다
+ * (우리 FORCE_ACTIVATE 채택분 + 키워드·sticky·데코레이터·constant 전부).
+ * 패널의 나머지 표는 전부 "우리 판정"이라, 프롬프트에 실제로 뭐가 들어갔는지는 여기서만 보인다.
+ * 최신 1턴만 보관. 엔트리 객체는 ST가 재사용할 수 있어 필요한 필드만 스냅샷으로 복사한다.
+ */
+let lastActivated = null; // { ts, entries: [{ world, uid, comment, content, constant }] }
 /** 변환 진행 중 플래그 — generateRaw는 인터셉터를 안 타지만(검증: script.js:4063→generateRawData 직행) 이중 실행·오발동 보험 */
 let conversionInProgress = false;
 /** Jev 전송 경로 캐시 (세션당 1회 감지). 판정 실패 시 null로 리셋 → 다음 턴 재감지 */
@@ -776,6 +785,11 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         let usedTokens = 0;
         for (const item of ranked) {
             if (item.final < SCORE_FLOOR) break; // 정렬됐으니 이후는 전부 하한 미만
+            // v0.9.0 개수 상한 — 키워드 발동은 상한 없이 ST가 알아서 돌고(확장 예산 밖),
+            // Jev 몫만 MAX_ADOPTED개로 조인다. ST WI 총예산은 기본 25% × max_context(90,000)
+            // ≈ 22,500이라, Jev를 3개로 줄여두면 키워드가 많이 걸리는 턴에도 총량이 안 터진다.
+            // 정렬이 점수 내림차순이므로 상한 도달 = 이후는 볼 것도 없다 → break.
+            if (adopted.length >= MAX_ADOPTED) break;
             const tokens = await getTokenCountAsync(item.text);
             if (usedTokens + tokens > budget) continue; // 남은 예산에 드는 다음 후보 탐색
             usedTokens += tokens;
@@ -1950,11 +1964,123 @@ async function renderPanelChunks($panel) {
     }
 }
 
+/**
+ * 이번 턴 실제 주입 (v0.9.0) — 우리 판정이 아니라 ST가 프롬프트에 정말로 넣은 것.
+ * 분류 3종:
+ *   ⭐ 코어    entry.constant === true (ST 네이티브 매턴 주입)
+ *   🧠 Jev     우리 채택 집합(lastJudgment.items)에 있는 것 = FORCE_ACTIVATE로 넣은 것
+ *   🔑 키워드  나머지 전부 (키워드·sticky·데코레이터·min_activations — 확장 예산 밖에서 걸린 것들)
+ * 키워드와 Jev는 OR로 병존한다. 이중 주입은 ST가 allActivatedEntries를
+ * `${world}.${uid}` 키 Map으로 들고 있어 자연 방지된다 (world-info.js:4685·4956 실측).
+ */
+function renderPanelInjected($panel) {
+    const $box = $panel.find('#jev_panel_injected').empty();
+    const $title = $panel.find('#jev_panel_injected_title');
+
+    if (!lastActivated || !lastActivated.entries.length) {
+        $title.text('이번 턴 실제 주입');
+        $box.append($('<div class="jev-panel-muted">').text('아직 기록이 없어요 — 메시지를 한 번 보내면 여기에 표시돼요.'));
+        return;
+    }
+
+    const adoptedKeys = new Set((lastJudgment?.items ?? []).map(i => `${i.world}.${i.uid}`));
+    const KIND_BADGE = { core: '⭐ 코어', jev: '🧠 Jev', keyword: '🔑 키워드' };
+    const classify = (e) => (e.constant === true)
+        ? 'core'
+        : (adoptedKeys.has(`${e.world}.${e.uid}`) ? 'jev' : 'keyword');
+
+    const rows = lastActivated.entries.map(e => ({ entry: e, kind: classify(e) }));
+    const counts = { core: 0, jev: 0, keyword: 0 };
+    for (const r of rows) counts[r.kind]++;
+    // 토큰은 비동기라 제목줄은 개수부터 띄우고 뒤에서 채운다 (fillStackTokens 선례, v0.6.3)
+    $title.text(`이번 턴 실제 주입 — ⭐${counts.core} / 🧠${counts.jev} / 🔑${counts.keyword} · 집계 중…`);
+
+    $box.append($('<div class="jev-panel-muted">').text(
+        `${new Date(lastActivated.ts).toLocaleTimeString()} 생성 · 총 ${rows.length}개`));
+
+    // 북별 그룹 헤더로 묶는다 (v0.8.0 패턴 재사용) — 4계층이라 여러 북이 섞인다.
+    const layerOf = new Map(getTargetWorldsDetailed().map(d => [d.name, d.layer]));
+    const headers = ['분류', '제목', '≈토큰', ''];
+    const $table = $('<table class="jev-panel-table">');
+    const $thead = $('<tr>');
+    for (const h of headers) {
+        $thead.append($('<th>').text(h));
+    }
+    $table.append($('<thead>').append($thead));
+    const $tbody = $('<tbody>');
+
+    const groups = new Map();
+    for (const r of rows) {
+        const key = String(r.entry.world);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(r);
+    }
+
+    const $tokenCells = [];
+    const ordered = [];
+    for (const [world, groupRows] of groups) {
+        const gc = { core: 0, jev: 0, keyword: 0 };
+        for (const r of groupRows) gc[r.kind]++;
+        const $groupCell = $('<td>').attr('colspan', headers.length);
+        const layer = layerOf.get(world);
+        if (layer) $groupCell.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
+        $groupCell.append($('<span class="jev-group-name">').text(world || '(이름 없음)'));
+        $groupCell.append($('<span class="jev-group-meta">').text(`⭐${gc.core} · 🧠${gc.jev} · 🔑${gc.keyword}`));
+        $tbody.append($('<tr class="jev-panel-group-row">').append($groupCell));
+
+        for (const r of groupRows) {
+            const content = String(r.entry.content ?? '');
+            const $tr = $('<tr>').toggleClass('jev-adopted', r.kind === 'jev');
+            $tr.append($('<td>').append($('<span class="jev-kind-badge">').addClass(`jev-kind-${r.kind}`).text(KIND_BADGE[r.kind])));
+            $tr.append($('<td class="jev-cell-title">').text(String(r.entry.comment || `uid ${r.entry.uid}`).slice(0, 48)));
+            const $tok = $('<td>').text('…');
+            $tr.append($tok);
+
+            // 전문 펼침은 기존 패턴 재사용 (buildDetailToggle, v0.6.4)
+            const { $cell, $detail } = buildDetailToggle(content, headers.length);
+            $tr.append($cell);
+            $tbody.append($tr).append($detail);
+
+            $tokenCells.push($tok);
+            ordered.push(r);
+        }
+    }
+    $table.append($tbody);
+    $box.append($table);
+
+    void fillInjectedTokens($title, $tokenCells, ordered);
+}
+
+/** 주입 표의 토큰을 뒤에서 채운다 — getTokenCountAsync가 비동기라 패널 렌더를 막지 않는다 */
+async function fillInjectedTokens($title, $cells, rows) {
+    try {
+        const counts = { core: 0, jev: 0, keyword: 0 };
+        const totals = { core: 0, jev: 0, keyword: 0 };
+        const tokens = await Promise.all(rows.map(r => {
+            const text = String(r.entry.content ?? '');
+            return text ? getTokenCountAsync(text) : Promise.resolve(0);
+        }));
+        for (let i = 0; i < rows.length; i++) {
+            counts[rows[i].kind]++;
+            totals[rows[i].kind] += tokens[i];
+            $cells[i].text(tokens[i].toLocaleString());
+        }
+        const sum = totals.core + totals.jev + totals.keyword;
+        $title.text('이번 턴 실제 주입 — '
+            + `⭐${counts.core}·${totals.core.toLocaleString()}tok / `
+            + `🧠${counts.jev}·${totals.jev.toLocaleString()}tok / `
+            + `🔑${counts.keyword}·${totals.keyword.toLocaleString()}tok`
+            + ` · 합계 ${sum.toLocaleString()}tok`);
+    } catch (error) {
+        $title.text(`이번 턴 실제 주입 — 토큰 집계에 실패했어요: ${error?.message ?? error}`);
+    }
+}
 /** 패널 전체 갱신 */
 async function refreshPanel($panel) {
     renderPanelSummary($panel);
     renderPanelWarnings($panel);
     renderPanelJudgment($panel);
+    renderPanelInjected($panel);
     await renderPanelChunks($panel);
 }
 
@@ -2356,6 +2482,25 @@ jQuery(async () => {
             populateWorldSelect();
             void renderLayerList();
         });
+    }
+
+    // 이번 턴 실제 주입 관측 (v0.9.0) — world-info.js:902 emit, isDryRun 턴에는 안 온다.
+    // 인자는 활성화된 전체 엔트리 배열. 최신 1턴만 스냅샷으로 들고 있는다(패널 표시 전용).
+    if (event_types.WORLD_INFO_ACTIVATED) {
+        eventSource.on(event_types.WORLD_INFO_ACTIVATED, (entries) => {
+            lastActivated = {
+                ts: Date.now(),
+                entries: (Array.isArray(entries) ? entries : []).map(e => ({
+                    world: String(e?.world ?? ""),
+                    uid: e?.uid,
+                    comment: String(e?.comment ?? ""),
+                    content: String(e?.content ?? ""),
+                    constant: e?.constant === true,
+                })),
+            };
+        });
+    } else {
+        console.warn(`${LOG} event_types.WORLD_INFO_ACTIVATED가 없다 — 이번 턴 주입 표는 비어 있게 된다`);
     }
 
     // 요술봉(#extensionsMenu) 항목 — 세부 조정은 여기서 (큰 분류는 확장 탭 서랍)
