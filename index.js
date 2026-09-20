@@ -61,7 +61,12 @@ const STORY_ANCHOR_META_KEY = 'jevLorebookStoryAnchor';
 const UNDO_META_KEY = 'jevLorebookUndo';
 const DEFAULT_SLICE_TOKENS = 18000; // 슬라이스당 대화 토큰 상한 기본값. v0.7.0에서 설정으로 개방
 const REAL_GAP_HOURS = 6;           // 실제 시간이 이만큼 벌어지면 전사에 장면 경계 힌트를 남긴다 (약한 힌트일 뿐)
-const CORE_COMMENT = '⭐ Core Memory';   // 코어 메모리 항목 식별자 (comment 고정 = upsert 키)
+// v0.13.0 — 코어 2층화(규칙/일기). 기존 단일 '⭐ Core Memory'는 레거시 식별자로만 남긴다(마이그레이션 입력용).
+const LEGACY_CORE_COMMENT = '⭐ Core Memory';        // 레거시 통짜 코어 — 마이그레이션 입력 + archived 표시 대상
+const LEGACY_CORE_ARCHIVED_SUFFIX = ' (archived)';   // 마이그레이션 후 레거시 항목에 붙이는 표시 (disable=true와 함께)
+const CORE_RULES_COMMENT = '⭐ Core Rules';           // 코어 규칙 항목 — 항상 1개, upsert 키(comment 완전일치)
+const CORE_DIARY_COMMENT_PREFIX = '⭐ Core Diary';    // 코어 일기 항목 comment 접두사 — 뒤에 '(sealed)'?·시작~종료일이 붙는다
+const DIARY_ARCHIVE_COMMENT_PREFIX = 'Diary Archive'; // 강등된(구) 일기 comment 접두사 — ⭐를 떼어 코어 계열 스캔에서 확실히 빠지게 한다
 
 // ── 본문 날짜 헤더 (v0.12.0) ────────────────────────────────────────────
 // ST는 주입 조립에 entry.content만 넣는다 (world-info.js:5095 `WIBeforeEntries.unshift(content)`).
@@ -94,8 +99,11 @@ const SPLIT_DATE_RE = /^[^\S\n]*(?:#{1,4}[^\S\n]*)?(?:\*\*)?[^\n]{0,20}?(\d{4}-\
 const SPLIT_MIN_CHUNK = 200;             // 이보다 작은 조각은 앞 덩어리에 흡수
 const SPLIT_EST_CHARS_PER_TOKEN = 3;     // 한글 혼용 보수 추정 (이식 원본과 동일)
 const SPLIT_BIG_CONSTANT_CHARS = 3000;   // constant 항목이 이 크기를 넘으면 기본 체크 후보 (≈1,000토큰)
-const CORE_TOKEN_LIMIT = 800;            // 코어 스냅샷 상한 — 프롬프트 강제, 초과 시 경고 로그
-const CORE_ORDER = 1000;                 // 코어 메모리 삽입 순서 — 일반 항목 기본값(100)보다 위
+const CORE_RULES_TOKEN_LIMIT = 400;      // 규칙 섹션 상한 — 프롬프트 강제 (v0.13.0, 기존 CORE_TOKEN_LIMIT 800을 규칙/일기로 분리)
+const CORE_DIARY_TOKEN_LIMIT = 600;      // 일기 섹션 상한 — 갱신 직후 이걸 넘으면 그 즉시 봉인(sealed)한다
+const CORE_DIARY_MAX_COUNT = 3;          // 슬라이딩 일기 개수 상한 — 넘으면 가장 오래된 것을 검색층으로 강등
+const CORE_RULES_ORDER = 1000;           // 코어 규칙 삽입 순서 — 최상단(일반 항목 기본값 100보다 위). 수동 승격(🔵)도 이 값을 쓴다
+const CORE_DIARY_ORDER_BASE = 999;       // 코어 일기 삽입 순서 기준 — 규칙 바로 아래. 오래된 것일수록 값이 크다(recomputeDiaryOrders)
 const NORMAL_ORDER = 100;                // 일반(검색층) 항목 순서 — 코어에서 강등할 때 되돌리는 값
 // 문장 종결부호 — 응답 끝줄이 이걸로 안 끝나면 잘림 의심 (프로필·현재연결 양쪽 공통 휴리스틱)
 const SENTENCE_END_RE = /[.!?"”'’)」』]$/;
@@ -137,24 +145,50 @@ function buildIncidentsPrompt(style, incidentMaxTokens, anchor) {
 }
 
 /**
- * 코어 갱신 전용 system prompt — 유저 편집 불가 (구조가 깨지면 코어 항목 upsert가 통째로 죽는다).
- * v0.7.0에서 사건 추출과 분리했다: 슬라이스마다 코어를 같이 시키면
- * (a) 사건 출력 예산을 코어가 갈라먹고 (b) 중간 슬라이스의 코어는 어차피 버려진다 — 호출 낭비.
+ * 코어 규칙/일기 갱신 전용 system prompt 2종 — 유저 편집 불가 (구조가 깨지면 upsert가 통째로 죽는다).
+ * v0.13.0에서 단일 CORE_PROMPT를 둘로 쪼갰다 — 가상 실행 실측(tmp/core_sim_*.md)에서 한 프롬프트가
+ * 규칙·일기를 동시에 쓰게 하면 (a) 미해결 질문이 규칙에 스며들고 (b) 일기가 "tonight" 장면 요약으로 미끄러졌다.
+ * 각자 책임을 분리하고 EXCLUDE 조항으로 서로의 영역을 명시적으로 밀어낸다.
  */
-const CORE_PROMPT = [
-    'You maintain the CORE STATE of an ongoing roleplay: what must NEVER be forgotten between sessions.',
-    'You are given the [Previous core state] and the [New incidents] extracted from the latest logs.',
-    'UPDATE the previous core state with what changed in the new incidents.',
-    'Present state only, never a running log of events. If nothing changed, restate it as-is.',
+const RULES_PROMPT = [
+    'You maintain the CORE RULES of an ongoing roleplay: constraints that must hold even in scenes where they are never mentioned.',
+    'You are given the [Previous rules] and the [New incidents] extracted from the latest logs.',
+    'UPDATE the previous rules with what changed in the new incidents. If nothing changed, restate them as-is.',
+    '',
+    'Include ONLY:',
+    '- Naming rules (how characters address each other)',
+    '- Knowledge boundaries (who knows / does not know what)',
+    '- Hard behavioral constraints (things a character always or never does)',
+    '- Identity-level secrets',
+    '',
+    'EXCLUDE:',
+    '- Relationship state, arcs, promises, plans (those belong to the diary, not here)',
+    '- Retrievable trivia: addresses, jobs, possessions, side characters, appearance, food',
+    '- Unanswered questions and pending answers are NOT rules; they belong to the diary\'s Ongoing. Never output them here.',
     '',
     'Strict output format:',
-    '- Output exactly one section, starting with the exact header line: ### CORE STATE',
+    '- Output exactly one section, starting with the exact header line: ### CORE RULES',
+    '- Each rule is one line starting with "- ".',
+    `- Keep the whole section under ${CORE_RULES_TOKEN_LIMIT} tokens.`,
+    '- Output in English. Output nothing else: no preamble, no commentary, no explanations.',
+].join('\n');
+
+const DIARY_PROMPT = [
+    'You maintain the current CORE DIARY segment of an ongoing roleplay: the present state of the relationship, never a running log of events.',
+    'You are given the [Previous current diary] and the [New incidents] extracted from the latest logs.',
+    'UPDATE the previous diary with what changed in the new incidents. Present state only. If nothing changed, restate it as-is.',
+    '',
+    'Do NOT output naming rules, knowledge boundaries, identity-level secrets, or immutable facts — those live in CORE RULES, not here.',
+    'Never write "tonight", "today", "this evening", or recap the newest scene. Record only the standing state that remains true after the scene ends.',
+    '',
+    'Strict output format:',
+    '- Output exactly one section, starting with a header line exactly like: ### CORE DIARY (date range)',
+    '  (Whatever date range you write there is discarded — the tool stamps its own. Any placeholder is fine.)',
     '- Format as short labeled lines — NO flowing prose, NO paragraphs:',
-    '  Relationship: <the current state in one line, as it stands NOW (confession/dating/conflict/etc.)>',
+    '  Relationship: <the current state in one line, as it stands NOW>',
     '  Dynamics: <how they treat each other now, 1-2 short lines>',
     '  Ongoing: <unresolved arcs, promises, plans — one per line, each starting with "- ">',
-    '  Facts: <immutable facts: identities, secrets known/unknown, living situation — one per line, each starting with "- ">',
-    `- Every line short and declarative. Keep the whole CORE STATE section under ${CORE_TOKEN_LIMIT} tokens.`,
+    `- Keep the whole section under ${CORE_DIARY_TOKEN_LIMIT} tokens.`,
     '- Output in English. Output nothing else: no preamble, no commentary.',
 ].join('\n');
 
@@ -491,7 +525,7 @@ async function setEntryCore(world, uid, toCore) {
     if (!entry) throw new Error(`uid ${uid} 항목을 찾지 못했어요`);
 
     entry.constant = !!toCore;
-    entry.order = toCore ? CORE_ORDER : NORMAL_ORDER;
+    entry.order = toCore ? CORE_RULES_ORDER : NORMAL_ORDER;
     await saveWorldInfo(world, worldData, true);
 
     if (!toCore) {
@@ -1159,9 +1193,180 @@ function parseConversionOutput(text) {
     return { incidents, core: coreLines.join('\n').trim() };
 }
 
-/** 로어북에서 코어 메모리 항목 찾기 (comment 고정 식별, upsert 키) */
-function findCoreEntry(worldData) {
-    return Object.values(worldData?.entries ?? {}).find(e => e.comment === CORE_COMMENT) ?? null;
+/**
+ * 코어 규칙/일기 탐색 (v0.13.0). 전부 constant===true && !disable을 조건에 넣는다 —
+ * 그래야 🔵🟢 수동 강등(setEntryCore)이 이 항목을 자동 갱신·슬라이딩 대상에서 확실히 빼낸다.
+ * (comment만 보고 판단했다면 수동으로 검색층에 내린 옛 일기를 다음 변환이 다시 '열린 일기'로 오인할 수 있었다.)
+ */
+function findCoreRulesEntry(worldData) {
+    return Object.values(worldData?.entries ?? {}).find(e => e.constant && !e.disable && e.comment === CORE_RULES_COMMENT) ?? null;
+}
+
+const CORE_DIARY_COMMENT_RE = /^⭐ Core Diary(?:\s*\(sealed\))?\s*·\s*(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})\s*$/;
+/** 일기 comment 파싱 — `⭐ Core Diary[ (sealed)] · <시작> ~ <종료>`. 못 읽으면 null(일기가 아님) */
+function parseDiaryComment(comment) {
+    const m = String(comment ?? '').match(CORE_DIARY_COMMENT_RE);
+    if (!m) return null;
+    return { start: m[1], end: m[2], sealed: /\(sealed\)/.test(comment) };
+}
+function isDiarySealed(entry) {
+    return !!parseDiaryComment(entry?.comment)?.sealed;
+}
+function buildDiaryComment(start, end, sealed) {
+    return `${CORE_DIARY_COMMENT_PREFIX}${sealed ? ' (sealed)' : ''} · ${start} ~ ${end}`;
+}
+/** 일기 항목 본문 헤더 — 모델은 날짜를 찍지만 코드가 항상 다시 찍는다(모델은 새 사건 날짜만 알지 범위는 모른다) */
+const DIARY_HEADER_RE = /^#{1,4}\s*\**\s*CORE\s+DIARY\b/i;
+function buildDiaryContent(start, end, body) {
+    return `### CORE DIARY (${start} ~ ${end})\n${body}`;
+}
+/** 저장된 일기 본문에서 코드가 찍은 헤더 줄을 떼고 라벨줄만 돌려준다 — 다음 프롬프트의 [Previous current diary] 입력용 */
+function stripDiaryHeader(content) {
+    const lines = String(content ?? '').split('\n');
+    if (lines.length && DIARY_HEADER_RE.test(lines[0])) {
+        return lines.slice(1).join('\n').trim();
+    }
+    return String(content ?? '').trim();
+}
+/** 로어북의 코어 일기 전부 — 오래된→최신 정렬 (constant===true인 것만, 강등된 건 안 잡힘) */
+function findCoreDiaryEntries(worldData) {
+    return Object.values(worldData?.entries ?? {})
+        .filter(e => e.constant && !e.disable && parseDiaryComment(e.comment))
+        .sort((a, b) => parseDiaryComment(a.comment).start.localeCompare(parseDiaryComment(b.comment).start));
+}
+/** 레거시 통짜 코어(마이그레이션 입력용) — archived 표시된 것은 comment가 달라져 자동으로 제외된다 */
+function findLegacyCoreEntry(worldData) {
+    return Object.values(worldData?.entries ?? {}).find(e => e.comment === LEGACY_CORE_COMMENT) ?? null;
+}
+/** 코어 계열(규칙/일기/강등된 일기/레거시) comment 판별 — 사건 날짜 스캔(countExistingForDate·latestDateInWorld)이 오염되지 않게 */
+function isCoreFamilyComment(comment) {
+    const c = String(comment ?? '');
+    return c === CORE_RULES_COMMENT
+        || c.startsWith(CORE_DIARY_COMMENT_PREFIX)
+        || c.startsWith(DIARY_ARCHIVE_COMMENT_PREFIX)
+        || c === LEGACY_CORE_COMMENT
+        || c.startsWith(`${LEGACY_CORE_COMMENT}${LEGACY_CORE_ARCHIVED_SUFFIX}`);
+}
+/** 코어 일기 order 재계산 — 규칙 바로 아래, 오래된 것일수록 규칙에 가깝게(값이 크게) 배치한다. 매 변환마다 전체 재배치 */
+function recomputeDiaryOrders(worldData) {
+    findCoreDiaryEntries(worldData).forEach((entry, idx) => {
+        entry.order = CORE_DIARY_ORDER_BASE - idx;
+    });
+}
+
+/** 모델 출력에서 지정 헤더 다음의 본문만 뽑는다 (RULES_PROMPT/DIARY_PROMPT 공용 파서) */
+function parseSingleSectionOutput(text, headerRe) {
+    const lines = String(text ?? '').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        if (headerRe.test(lines[i])) {
+            return lines.slice(i + 1).join('\n').trim();
+        }
+    }
+    return '';
+}
+const RULES_HEADER_RE = /^#{1,4}\s*\**\s*CORE\s+RULES\b/i;
+
+/**
+ * 코어 규칙/일기 갱신 공용 — 프롬프트만 다르고 재시도(최대 2회)·잘림 검증·섹션 파싱은 같다 (v0.13.0).
+ * 코어는 라벨·불릿 포맷이라 문장으로 안 끝나는 게 정상 → 끝줄 검사(checkTail)는 끈다.
+ * @returns {Promise<{ok:boolean, body:string, warnings:string[], failReason:string}>}
+ */
+async function updateCoreSection(ctx, { systemPrompt, previousLabel, previousBody, digest, maxTokens, headerRe, retryLabel }) {
+    const warnings = [];
+    const userPrompt = `[${previousLabel}]\n${previousBody || '(none)'}\n\n[New incidents]\n${digest}`;
+    let body = '';
+    let ok = false;
+    let failReason = '';
+    for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
+        const label = attempt === 1 ? retryLabel : `${retryLabel}(재시도)`;
+        try {
+            const { text: raw } = await generateConversion(ctx, systemPrompt, userPrompt);
+            const sectionWarnings = await detectTruncation(raw, maxTokens, label, { checkTail: false });
+            const parsed = parseSingleSectionOutput(raw, headerRe);
+            if (parsed) {
+                body = parsed;
+                ok = true;
+                warnings.push(...sectionWarnings); // 채택한 응답의 경고만 남긴다 — 버린 시도의 경고는 소음이다
+            } else {
+                failReason = `${label}: 응답에 섹션 헤더가 없거나 본문이 비었어요`;
+                console.warn(`${LOG} ${failReason}`);
+            }
+        } catch (error) {
+            failReason = `${label}: ${error?.message ?? error}`;
+            console.warn(`${LOG} ${failReason}`);
+        }
+    }
+    return { ok, body, warnings, failReason };
+}
+
+// ── 이월 검산 (v0.13.0 핵심) ────────────────────────────────────────
+// 가상 실행에서 실측된 실패: 이전 일기 Ongoing 한 줄("바론 생일 3월+반지 선물 계획")이 경고 없이 증발했다.
+// 프롬프트 지시로는 못 막는다 — 코드가 이전 줄 하나하나를 새 출력과 대조해서 사라진 걸 잡아낸다.
+/** Ongoing 줄 정규화 — 대소문자·구두점·머리 불릿을 지워 겹침 비교를 안정화한다 */
+function normalizeOngoingLine(line) {
+    return String(line ?? '')
+        .replace(/^[-*]\s*/, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9가-힣\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+/** 일기 본문(헤더 제외)에서 Ongoing: 섹션의 줄만 뽑는다 */
+function extractOngoingLines(diaryBody) {
+    const lines = String(diaryBody ?? '').split('\n');
+    const out = [];
+    let inOngoing = false;
+    for (const line of lines) {
+        if (/^\s*Ongoing\s*:/i.test(line)) {
+            inOngoing = true;
+            const rest = line.replace(/^\s*Ongoing\s*:\s*/i, '').trim();
+            if (rest) out.push(rest.replace(/^[-*]\s*/, ''));
+            continue;
+        }
+        if (inOngoing) {
+            if (/^\s*(Relationship|Dynamics|Ongoing)\s*:/i.test(line)) { inOngoing = false; continue; }
+            const trimmed = line.trim();
+            if (trimmed) out.push(trimmed.replace(/^[-*]\s*/, ''));
+        }
+    }
+    return out.filter(Boolean);
+}
+/** 이전 Ongoing 한 줄이 새 일기에 (부분일치·토큰겹침 60% 이상으로) 살아남았는지 */
+function ongoingLineSurvives(prevLine, newBody) {
+    const prevNorm = normalizeOngoingLine(prevLine);
+    if (!prevNorm) return true;
+    for (const newLine of extractOngoingLines(newBody)) {
+        const newNorm = normalizeOngoingLine(newLine);
+        if (!newNorm) continue;
+        if (newNorm.includes(prevNorm) || prevNorm.includes(newNorm)) return true;
+        const prevTokens = new Set(prevNorm.split(' ').filter(w => w.length >= 3));
+        if (!prevTokens.size) continue;
+        const newTokens = new Set(newNorm.split(' ').filter(w => w.length >= 3));
+        let overlap = 0;
+        for (const t of prevTokens) if (newTokens.has(t)) overlap++;
+        if (overlap / prevTokens.size >= 0.6) return true;
+    }
+    return false;
+}
+/** 이전 일기 Ongoing 각 줄이 새 일기에서 사라졌는지 대조 — 사라진 줄만 돌려준다. 자동 복구는 하지 않는다(호출부가 경고만 만든다) */
+function checkOngoingCarryover(prevBody, newBody) {
+    return extractOngoingLines(prevBody).filter(line => !ongoingLineSurvives(line, newBody));
+}
+/** 강등 시 미해결 Ongoing을 현재 일기에 기계적으로 합친다(모델에 맡기지 않는다) — 정규화 중복은 걸러낸다 */
+function appendOngoingLines(diaryBody, newLines) {
+    if (!newLines.length) return diaryBody;
+    const lines = String(diaryBody ?? '').split('\n');
+    const ongoingIdx = lines.findIndex(l => /^\s*Ongoing\s*:/i.test(l));
+    const additions = newLines.map(l => `- ${String(l).replace(/^[-*]\s*/, '').trim()}`);
+    if (ongoingIdx === -1) {
+        return `${diaryBody}\nOngoing:\n${additions.join('\n')}`.trim();
+    }
+    let insertAt = lines.length;
+    for (let i = ongoingIdx + 1; i < lines.length; i++) {
+        if (/^\s*(Relationship|Dynamics|Ongoing)\s*:/i.test(lines[i])) { insertAt = i; break; }
+    }
+    lines.splice(insertAt, 0, ...additions);
+    return lines.join('\n').trim();
 }
 
 /**
@@ -1172,7 +1377,7 @@ function countExistingForDate(worldData, date) {
     if (!date) return 0;
     let n = 0;
     for (const e of Object.values(worldData?.entries ?? {})) {
-        if (e.comment === CORE_COMMENT) continue;
+        if (e.constant || isCoreFamilyComment(e.comment)) continue; // 코어 계열(규칙/일기/레거시)은 사건이 아니다
         if (String(e.comment ?? '').includes(date)) n++;
     }
     return n;
@@ -1182,7 +1387,7 @@ function countExistingForDate(worldData, date) {
 function latestDateInWorld(worldData) {
     let latest = '';
     for (const e of Object.values(worldData?.entries ?? {})) {
-        if (e.comment === CORE_COMMENT) continue;
+        if (e.constant || isCoreFamilyComment(e.comment)) continue;
         for (const d of String(e.comment ?? '').match(/\d{4}-\d{2}-\d{2}/g) ?? []) {
             if (d > latest) latest = d; // YYYY-MM-DD는 사전순 = 시간순
         }
@@ -1392,7 +1597,27 @@ async function convertChatToLorebook(setStatus) {
         if (!worldData?.entries) {
             throw new Error(`로어북 '${world}' 로드 실패`);
         }
-        let coreState = String(findCoreEntry(worldData)?.content ?? '').trim();
+        // v0.13.0 — 코어 2층화: 이전 상태를 규칙/일기 두 갈래로 읽는다.
+        // 레거시 마이그레이션: 신형 항목이 하나도 없고 구형 '⭐ Core Memory'만 있으면 그 내용을 양쪽 입력으로 공급한다.
+        const rulesEntryBefore = findCoreRulesEntry(worldData);
+        const diaryEntriesBefore = findCoreDiaryEntries(worldData); // 오래된→최신
+        const openDiaryBefore = diaryEntriesBefore.find(e => !isDiarySealed(e)) ?? null;
+        const legacyEntry = (!rulesEntryBefore && !diaryEntriesBefore.length) ? findLegacyCoreEntry(worldData) : null;
+        let prevRulesBody = String(rulesEntryBefore?.content ?? '').trim();
+        let prevDiaryBody = openDiaryBefore ? stripDiaryHeader(openDiaryBefore.content) : '';
+        if (legacyEntry) {
+            const legacyBody = String(legacyEntry.content ?? '').trim();
+            prevRulesBody = legacyBody;
+            prevDiaryBody = legacyBody;
+            console.log(`${LOG} 레거시 '${LEGACY_CORE_COMMENT}' 감지 — 규칙/일기 양쪽 입력으로 공급해 마이그레이션한다`);
+        }
+        // 되돌리기 스냅샷용 — 이번 실행이 건드리기 전의 규칙/일기 전량을 그대로 잡아둔다 (덮어쓰거나 강등해도 전부 복원 가능하게)
+        const prevCoreRulesSnap = rulesEntryBefore
+            ? { uid: rulesEntryBefore.uid, existed: true, content: String(rulesEntryBefore.content ?? '') }
+            : { uid: null, existed: false, content: '' };
+        const prevCoreDiariesSnap = diaryEntriesBefore.map(e => ({
+            uid: e.uid, comment: e.comment, content: String(e.content ?? ''), constant: e.constant, order: e.order,
+        }));
         const anchor = resolveStoryAnchor(ctx, worldData, fresh);
 
         setStatus('슬라이스 계산 중…');
@@ -1400,7 +1625,7 @@ async function convertChatToLorebook(setStatus) {
         const maxTokens = getConvertMaxTokens();
         const slices = await buildSlices(fresh, sliceTokens);
         const incidentsPrompt = buildIncidentsPrompt(getConvertStyle(), getIncidentMaxTokens(), anchor);
-        console.log(`${LOG} 변환 시작 — 대상='${world}' 메시지 ${fresh.length}건(인덱스 ${startIndex}~${endIndex}, 최근 ${keepRecent}개 보존) → 슬라이스 ${slices.length}개(${sliceTokens}토큰 단위) / 작중 앵커 '${anchor || '없음'}' / 이전 코어 ${coreState ? '있음' : '없음'}`);
+        console.log(`${LOG} 변환 시작 — 대상='${world}' 메시지 ${fresh.length}건(인덱스 ${startIndex}~${endIndex}, 최근 ${keepRecent}개 보존) → 슬라이스 ${slices.length}개(${sliceTokens}토큰 단위) / 작중 앵커 '${anchor || '없음'}' / 이전 규칙 ${prevRulesBody ? '있음' : '없음'} / 이전 일기 ${prevDiaryBody ? '있음' : '없음'}`);
 
         // 1. 슬라이스별 사건 추출 — 이 호출들은 코어를 전혀 다루지 않는다 (출력 예산 전액을 사건에 쓴다)
         const incidents = [];
@@ -1435,38 +1660,53 @@ async function convertChatToLorebook(setStatus) {
         if (!incidents.length) {
             throw new Error('출력에서 사건 헤더(### YYYY-MM-DD — 제목)를 하나도 찾지 못했어요 — 항목과 변환 지점은 저장하지 않았어요');
         }
+        // 코어 일기 종료일 + 다음 변환 앵커로 쓴다 (v0.13.0: 2b가 필요로 해서 여기로 끌어올림, 기존엔 3단계에서 계산했다)
+        const lastDate = incidents[incidents.length - 1]?.date;
 
-        // 1b. 코어 갱신 1회 — 입력은 전사 원문이 아니라 이번에 뽑은 사건 요약본 전체.
-        //     형식이 깨지면 1회만 재시도하고, 그래도 안 되면 코어만 손대지 않고 진행한다 (사건은 살린다).
-        setStatus(`코어 메모리 갱신 중… (${getConvertProfileLabel()})`);
+        // 1b. 코어 규칙·일기 갱신 — 각 1회 호출(형식 불일치 시 1회 재시도), 입력은 전사 원문이 아니라
+        //     이번에 뽑은 사건 요약본 전체(v0.7.0 결정 유지). 실패한 쪽만 손대지 않고 진행한다(사건은 살린다).
         const digest = incidents.map(inc => `### ${inc.date} — ${inc.title}\n${inc.body}`).join('\n\n');
-        const corePrompt = `[Previous core state]\n${coreState || '(none)'}\n\n[New incidents]\n${digest}`;
-        let coreUpdated = false;
-        let coreFailReason = '';
-        for (let attempt = 1; attempt <= 2 && !coreUpdated; attempt++) {
-            const label = attempt === 1 ? '코어 갱신' : '코어 갱신(재시도)';
-            try {
-                // 코어는 라벨·불릿 포맷이라 문장으로 안 끝나는 게 정상 → 끝줄 검사를 끈다.
-                // 구조 검증은 아래 parsed.core (### CORE STATE 섹션 유무)가 이미 맡고 있다.
-                const { text: raw } = await generateConversion(ctx, CORE_PROMPT, corePrompt);
-                const coreWarnings = await detectTruncation(raw, maxTokens, label, { checkTail: false });
-                const parsed = parseConversionOutput(raw);
-                if (parsed.core) {
-                    coreState = parsed.core;
-                    coreUpdated = true;
-                    warnings.push(...coreWarnings); // 채택한 응답의 경고만 남긴다 — 버린 시도의 경고는 소음이다
-                } else {
-                    coreFailReason = `${label}: 응답에 ### CORE STATE 섹션이 없거나 본문이 비었어요`;
-                    console.warn(`${LOG} ${coreFailReason}`);
+
+        setStatus(`코어 규칙 갱신 중… (${getConvertProfileLabel()})`);
+        const rulesResult = await updateCoreSection(ctx, {
+            systemPrompt: RULES_PROMPT,
+            previousLabel: 'Previous rules',
+            previousBody: prevRulesBody,
+            digest,
+            maxTokens,
+            headerRe: RULES_HEADER_RE,
+            retryLabel: '코어 규칙 갱신',
+        });
+        if (!rulesResult.ok) {
+            warnings.push(`코어 규칙을 갱신하지 못했어요 (사건은 그대로 저장했어요) — ${rulesResult.failReason || '사유 미상'}`);
+        } else {
+            warnings.push(...rulesResult.warnings);
+        }
+
+        setStatus(`코어 일기 갱신 중… (${getConvertProfileLabel()})`);
+        const diaryResult = await updateCoreSection(ctx, {
+            systemPrompt: DIARY_PROMPT,
+            previousLabel: 'Previous current diary',
+            previousBody: prevDiaryBody,
+            digest,
+            maxTokens,
+            headerRe: DIARY_HEADER_RE,
+            retryLabel: '코어 일기 갱신',
+        });
+        if (!diaryResult.ok) {
+            warnings.push(`코어 일기를 갱신하지 못했어요 (사건은 그대로 저장했어요) — ${diaryResult.failReason || '사유 미상'}`);
+        } else {
+            warnings.push(...diaryResult.warnings);
+            // 이월 검산 (v0.13.0 핵심, 프롬프트로 못 막는다는 게 실측됨) — 사라진 줄은 경고만, 자동 복구는 안 한다.
+            if (prevDiaryBody) {
+                for (const line of checkOngoingCarryover(prevDiaryBody, diaryResult.body)) {
+                    warnings.push(`이월 검산: 이전 일기의 Ongoing 항목이 새 일기에서 안 보여요 — "${line.slice(0, 80)}" (정당한 해소일 수도 있어요, 자동 복구는 하지 않았어요)`);
                 }
-            } catch (error) {
-                coreFailReason = `${label}: ${error?.message ?? error}`;
-                console.warn(`${LOG} ${coreFailReason}`);
             }
         }
-        if (!coreUpdated) {
+        const coreUpdated = rulesResult.ok || diaryResult.ok; // 아래 완료 요약 문구용 — 최소 하나는 갱신됐나
+        if (!rulesResult.ok && !diaryResult.ok) {
             coreFailed = true;
-            warnings.push(`코어 메모리를 갱신하지 못했어요 (사건은 그대로 저장했어요) — ${coreFailReason || '사유 미상'}`);
         }
 
         // 2. 로어북 항목 추가 — createWorldInfoEntry가 uid를 충돌 없이 할당 (world-info.js:4057)
@@ -1502,48 +1742,111 @@ async function convertChatToLorebook(setStatus) {
             entry.disable = false;
         }
 
-        let prevCore = null; // 되돌리기용 — 코어는 upsert라 덮어쓰면 이전 본문이 사라진다
-        // 2b. 코어 메모리 upsert — constant:true = ST가 매턴 네이티브 주입 (Jev 판정·색인 밖 — 설계 의도)
-        //     갱신에 실패했으면 기존 코어 항목은 건드리지 않는다 (덮어쓸 새 값이 없다).
-        if (coreState && coreUpdated) {
-            const coreTokens = await getTokenCountAsync(coreState);
-            if (coreTokens > CORE_TOKEN_LIMIT) {
-                console.warn(`${LOG} 코어 스냅샷 ${coreTokens}토큰 — 상한 ${CORE_TOKEN_LIMIT} 초과 (자르지 않고 그대로 저장, 다음 변환에서 재압축됨)`);
+        // 2b. 코어 규칙/일기 upsert — constant:true = ST가 매턴 네이티브 주입 (Jev 판정·색인 밖, 설계 의도).
+        //     각자 갱신에 실패했으면 그 항목은 건드리지 않는다 (덮어쓸 새 값이 없다).
+        let rulesUpdatedNote = '미갱신';
+        if (rulesResult.ok) {
+            const rulesTokens = await getTokenCountAsync(rulesResult.body);
+            if (rulesTokens > CORE_RULES_TOKEN_LIMIT) {
+                console.warn(`${LOG} 코어 규칙 ${rulesTokens}토큰 — 상한 ${CORE_RULES_TOKEN_LIMIT} 초과 (자르지 않고 그대로 저장)`);
             }
-            let coreEntry = findCoreEntry(worldData);
-            if (coreEntry) {
-                // 되돌리기용: 코어는 upsert라 덮어쓰면 이전 본문이 사라진다
-                prevCore = { uid: coreEntry.uid, content: String(coreEntry.content ?? ''), existed: true };
-            } else {
-                coreEntry = createWorldInfoEntry(world, worldData);
-                if (!coreEntry) throw new Error('코어 항목 uid 할당 실패');
-                coreEntry.comment = CORE_COMMENT;
-                prevCore = { uid: coreEntry.uid, content: '', existed: false };
+            let rulesEntry = findCoreRulesEntry(worldData);
+            if (!rulesEntry) {
+                rulesEntry = createWorldInfoEntry(world, worldData);
+                if (!rulesEntry) throw new Error('코어 규칙 항목 uid 할당 실패');
+                rulesEntry.comment = CORE_RULES_COMMENT;
+                addedUids.push(rulesEntry.uid); // 되돌리기 — 이번 실행이 새로 만든 것이면 통째로 지운다
             }
-            coreEntry.key = [];
-            coreEntry.order = CORE_ORDER; // 일반 항목(기본 100)보다 위 — 프롬프트 최상단 고정
-            coreEntry.content = coreState;
-            coreEntry.constant = true;
-            coreEntry.disable = false;
-            console.log(`${LOG} 코어 메모리 upsert — ${coreTokens}토큰 (constant, 매턴 네이티브 주입)`);
+            rulesEntry.key = [];
+            rulesEntry.order = CORE_RULES_ORDER;
+            rulesEntry.content = rulesResult.body;
+            rulesEntry.constant = true;
+            rulesEntry.disable = false;
+            rulesUpdatedNote = `갱신(${rulesTokens}토큰)`;
+            console.log(`${LOG} 코어 규칙 upsert — ${rulesTokens}토큰 (constant, 매턴 네이티브 주입)`);
         } else {
-            console.warn(`${LOG} 코어 미갱신 — 기존 코어 항목을 그대로 둔다`);
+            console.warn(`${LOG} 코어 규칙 미갱신 — 기존 항목을 그대로 둔다`);
+        }
+
+        let diaryUpdatedNote = '미갱신';
+        if (diaryResult.ok) {
+            const diaryStart = openDiaryBefore ? (parseDiaryComment(openDiaryBefore.comment)?.start ?? anchor) : anchor;
+            const diaryEnd = lastDate || diaryStart;
+            const diaryContent = buildDiaryContent(diaryStart, diaryEnd, diaryResult.body);
+            const diaryTokens = await getTokenCountAsync(diaryContent);
+            const sealNow = diaryTokens > CORE_DIARY_TOKEN_LIMIT;
+
+            let diaryEntry = openDiaryBefore ? worldData.entries?.[String(openDiaryBefore.uid)] : null;
+            if (!diaryEntry) {
+                diaryEntry = createWorldInfoEntry(world, worldData);
+                if (!diaryEntry) throw new Error('코어 일기 항목 uid 할당 실패');
+                addedUids.push(diaryEntry.uid); // 되돌리기 — 이번 실행이 새로 연 일기면 통째로 지운다
+            }
+            diaryEntry.key = [];
+            diaryEntry.comment = buildDiaryComment(diaryStart, diaryEnd, sealNow);
+            diaryEntry.content = diaryContent;
+            diaryEntry.constant = true;
+            diaryEntry.disable = false;
+            diaryUpdatedNote = `갱신(${diaryTokens}토큰${sealNow ? ' · 봉인' : ''})`;
+            console.log(`${LOG} 코어 일기 upsert — '${diaryEntry.comment}' ${diaryTokens}토큰${sealNow ? ' (600토큰 초과 — 봉인, 다음 변환부터 새 일기)' : ''}`);
+
+            // 개수 상한(3개) 초과분 강등 — 봉인으로 새로 닫혔든, 이미 꽉 찬 상태에서 새로 열었든 매번 확인한다.
+            // while: 정상 경로는 실행당 최대 +1이라 한 번이면 끝나지만, 방어적으로 반복한다.
+            while (true) {
+                const nowDiaries = findCoreDiaryEntries(worldData); // 오래된→최신, constant=true인 것만
+                if (nowDiaries.length <= CORE_DIARY_MAX_COUNT) break;
+                const oldest = nowDiaries[0];
+                const oldestMeta = parseDiaryComment(oldest.comment);
+                const target = nowDiaries[nowDiaries.length - 1]; // 강등 시점의 최신 일기 = Ongoing 인수자
+                if (target && target.uid !== oldest.uid) {
+                    const oldestOngoing = extractOngoingLines(stripDiaryHeader(oldest.content));
+                    const targetBodyBefore = stripDiaryHeader(target.content);
+                    const targetNorm = extractOngoingLines(targetBodyBefore).map(normalizeOngoingLine);
+                    const toAppend = oldestOngoing.filter(line => {
+                        const norm = normalizeOngoingLine(line);
+                        return norm && !targetNorm.some(t => t === norm || t.includes(norm) || norm.includes(t));
+                    });
+                    if (toAppend.length) {
+                        const targetMeta = parseDiaryComment(target.comment);
+                        const mergedBody = appendOngoingLines(targetBodyBefore, toAppend);
+                        target.content = buildDiaryContent(targetMeta.start, targetMeta.end, mergedBody);
+                        console.log(`${LOG} 강등 이월 — '${oldest.comment}'의 미해결 Ongoing ${toAppend.length}줄을 '${target.comment}'에 기계적으로 append`);
+                    }
+                }
+                oldest.constant = false;
+                oldest.order = NORMAL_ORDER;
+                oldest.comment = `${DIARY_ARCHIVE_COMMENT_PREFIX} · ${oldestMeta?.start ?? ''} ~ ${oldestMeta?.end ?? ''}`;
+                console.log(`${LOG} 코어 일기 강등 — uid ${oldest.uid} → 검색층(order ${NORMAL_ORDER}, 다음 재색인에 포함됨)`);
+            }
+            recomputeDiaryOrders(worldData);
+        } else {
+            console.warn(`${LOG} 코어 일기 미갱신 — 기존 항목을 그대로 둔다`);
+        }
+
+        // 레거시 마이그레이션 완료 표시 — 규칙·일기 둘 다 갱신에 성공했을 때만 archived 처리한다.
+        // 하나라도 실패하면 레거시 항목을 그대로 살려 둔다(constant 유지 = 계속 매턴 주입) — 다음 변환에서 재시도.
+        if (legacyEntry && rulesResult.ok && diaryResult.ok) {
+            legacyEntry.disable = true;
+            legacyEntry.comment = `${LEGACY_CORE_COMMENT}${LEGACY_CORE_ARCHIVED_SUFFIX}`;
+            console.log(`${LOG} 레거시 코어 항목(uid ${legacyEntry.uid}) → 규칙/일기 마이그레이션 완료, disable+archived 표시`);
+        } else if (legacyEntry) {
+            warnings.push('레거시 코어 메모리 마이그레이션이 완전히 끝나지 않았어요 — 다음 변환에서 다시 시도해요 (기존 항목은 그대로 매턴 주입돼요).');
         }
 
         await saveWorldInfo(world, worldData, true);
         reloadEditor(world); // 에디터에 이 로어북이 열려 있으면 실시간 갱신 (world-info.js:1040, 강제 오픈 없음)
 
         // 3. 변환 지점 + 작중 날짜 앵커 기록 (chat_metadata — 이 채팅에만 귀속)
-        //    앵커 = 마지막 사건의 날짜. 다음 변환이 여기서부터 경과를 센다.
+        //    앵커 = 마지막 사건의 날짜(lastDate, 2b 이전에 계산해 둠). 다음 변환이 여기서부터 경과를 센다.
         ctx.chatMetadata[CONVERT_META_KEY] = endIndex;
-        const lastDate = incidents[incidents.length - 1]?.date;
         if (lastDate) ctx.chatMetadata[STORY_ANCHOR_META_KEY] = lastDate;
         // C(v0.11.0): 되돌리기 스냅샷. 항목 저장이 끝난 뒤에 남긴다 — 저장이 실패했으면 되돌릴 것도 없다.
         ctx.chatMetadata[UNDO_META_KEY] = {
             ts: Date.now(),
             world,
             addedUids,
-            prevCore,
+            prevCoreRules: prevCoreRulesSnap,
+            prevCoreDiaries: prevCoreDiariesSnap,
             prevMarker: prevMarker ?? null,
             prevAnchor: prevAnchor ?? null,
             hiddenFrom: startIndex,
@@ -1564,7 +1867,7 @@ async function convertChatToLorebook(setStatus) {
 
         const ms = Math.round(performance.now() - t0);
         lastConvertWarnings = warnings.slice();
-        const summary = `사건 ${incidents.length}건 추가 · 코어 ${coreUpdated ? '갱신' : '미갱신'} · 앵커 ${lastDate || '유지'} · ${indexed}개 색인 · 메시지 ${hiddenCount}개 변환·숨김, 최근 ${keepRecent}개 유지 (${ms}ms)`;
+        const summary = `사건 ${incidents.length}건 추가 · 규칙 ${rulesUpdatedNote} · 일기 ${diaryUpdatedNote} · 앵커 ${lastDate || '유지'} · ${indexed}개 색인 · 메시지 ${hiddenCount}개 변환·숨김, 최근 ${keepRecent}개 유지 (${ms}ms)`;
         const toastBody = `변환을 마쳤어요: 사건 ${incidents.length}건 · 메시지 ${hiddenCount}개 숨김 · 최근 ${keepRecent}개는 원문 유지 — ${world}.`;
         const toastOptions = { onclick: () => openWorldEditor(world), timeOut: 10000 };
 
@@ -1609,7 +1912,7 @@ async function migrateContentHeaders(world) {
 
     let patched = 0;
     for (const entry of entries) {
-        if (entry.constant || entry.comment === CORE_COMMENT) continue;
+        if (entry.constant) continue; // 코어 계열(규칙/일기/레거시)은 전부 constant=true라 이 조건 하나로 걸러진다
         const body = String(entry.content ?? '');
         if (!body.trim()) continue;
         if (INCIDENT_HEADER_RE.test(body)) continue;
@@ -1895,21 +2198,54 @@ async function undoLastConversion(setStatus) {
         }
     }
 
-    let coreNote = '코어 변경 없음';
-    if (snap.prevCore) {
-        const key = String(snap.prevCore.uid);
-        if (snap.prevCore.existed) {
-            const entry = worldData.entries?.[key];
+    // 코어 규칙 복원 (v0.13.0) — 이번 실행이 새로 만든 것이면 삭제, 있던 것이면 본문만 되돌린다.
+    let rulesNote = '규칙 변경 없음';
+    if (snap.prevCoreRules) {
+        if (snap.prevCoreRules.existed) {
+            const entry = worldData.entries?.[String(snap.prevCoreRules.uid)];
             if (entry) {
-                entry.content = snap.prevCore.content;
-                coreNote = '코어 본문 복원';
+                entry.content = snap.prevCoreRules.content;
+                rulesNote = '규칙 본문 복원';
             } else {
-                coreNote = '코어 항목을 찾지 못해 복원 안 됨';
+                rulesNote = '규칙 항목을 찾지 못해 복원 안 됨';
             }
-        } else if (worldData.entries?.[key]) {
-            delete worldData.entries[key];
-            removed++;
-            coreNote = '코어 항목 삭제 (이번 변환에서 새로 만든 것)';
+        } else {
+            const cur = findCoreRulesEntry(worldData);
+            if (cur) {
+                delete worldData.entries[String(cur.uid)];
+                removed++;
+                rulesNote = '규칙 항목 삭제 (이번 변환에서 새로 만든 것)';
+            }
+        }
+    }
+
+    // 코어 일기 복원 (v0.13.0) — 갱신·봉인·강등을 전부 스냅샷 통째 비교로 되돌린다.
+    // 이번 실행 전에 없던 일기(새로 연 것)는 삭제, 있던 것은 comment/content/constant/order를 그대로 되돌린다.
+    let diaryNote = '일기 변경 없음';
+    if (Array.isArray(snap.prevCoreDiaries)) {
+        const prevUids = new Set(snap.prevCoreDiaries.map(d => String(d.uid)));
+        const nowDiaryLike = Object.values(worldData.entries ?? {})
+            .filter(e => parseDiaryComment(e.comment) || String(e.comment ?? '').startsWith(DIARY_ARCHIVE_COMMENT_PREFIX));
+        let deletedNew = 0;
+        for (const e of nowDiaryLike) {
+            if (!prevUids.has(String(e.uid))) {
+                delete worldData.entries[String(e.uid)];
+                removed++;
+                deletedNew++;
+            }
+        }
+        let restored = 0;
+        for (const d of snap.prevCoreDiaries) {
+            const entry = worldData.entries?.[String(d.uid)];
+            if (!entry) continue;
+            entry.comment = d.comment;
+            entry.content = d.content;
+            entry.constant = d.constant;
+            entry.order = d.order;
+            restored++;
+        }
+        if (deletedNew || restored) {
+            diaryNote = `일기 ${restored}개 복원${deletedNew ? ` · 신규 ${deletedNew}개 삭제` : ''}`;
         }
     }
     await saveWorldInfo(snap.world, worldData, true);
@@ -1934,8 +2270,8 @@ async function undoLastConversion(setStatus) {
     setStatus('재색인 중…');
     const indexed = await indexWorld(snap.world, setStatus);
     lastConvertWarnings = [];
-    console.log(`${LOG} 되돌리기 완료 — 항목 ${removed}개 삭제 / ${coreNote} / 메시지 ${unhidden}개 복구 / ${indexed}개 재색인`);
-    return { removed, coreNote, unhidden, indexed };
+    console.log(`${LOG} 되돌리기 완료 — 항목 ${removed}개 삭제 / ${rulesNote} / ${diaryNote} / 메시지 ${unhidden}개 복구 / ${indexed}개 재색인`);
+    return { removed, rulesNote, diaryNote, unhidden, indexed };
 }
 
 /** 되돌리기 버튼 노출 — 스냅샷이 있을 때만 (v0.11.0) */
@@ -2149,8 +2485,12 @@ async function renderPanelChunks($panel) {
             worldData = null;
         }
         const allEntries = Object.values(worldData?.entries ?? {});
-        // 코어(constant) 항목은 색인·판정 밖 — 별도 섹션으로 표시
+        // 코어(constant) 항목은 색인·판정 밖 — 별도 섹션으로 표시. v0.13.0: 규칙/일기/기타(수동 승격)로 다시 나눈다.
         const coreEntries = allEntries.filter(e => e.constant && !e.disable && String(e.content ?? '').trim());
+        const coreRules = coreEntries.filter(e => e.comment === CORE_RULES_COMMENT);
+        const coreDiaries = coreEntries.filter(e => parseDiaryComment(e.comment))
+            .sort((a, b) => parseDiaryComment(a.comment).start.localeCompare(parseDiaryComment(b.comment).start));
+        const coreOther = coreEntries.filter(e => e.comment !== CORE_RULES_COMMENT && !parseDiaryComment(e.comment));
         const entries = allEntries.filter(e => !e.disable && !e.constant && String(e.content ?? '').trim());
         const disabledCount = allEntries.length - entries.length - coreEntries.length;
 
@@ -2195,33 +2535,40 @@ async function renderPanelChunks($panel) {
         $section.append($('<div class="jev-panel-muted">').text(
             '🔵 = 상시 메모리(매 턴 주입) · 🟢 = 검색층 / 누르면 전환할 수 있습니다.'));
 
-        // 코어 메모리 섹션 — constant라 ST가 매턴 네이티브 주입, Jev 판정·벡터 색인 제외.
-        // v0.6.4: 아래 색인 현황과 같은 표 형식 + 합계 토큰. 코어는 매 턴 고정비용이라
-        // 파란불을 늘릴수록 이 숫자가 올라간다 — 개수만 보여주면 늘린 대가가 안 보인다.
+        // 코어 섹션 — constant라 ST가 매턴 네이티브 주입, Jev 판정·벡터 색인 제외.
+        // v0.13.0: 규칙(최대 1) · 일기(최대 3, 오래된→최신, 봉인/열림 배지) · 기타(수동 승격분)를 구분 표시한다.
         if (coreEntries.length) {
             const coreTokens = coreEntries.reduce((sum, e) => sum + approxTokens(e.content), 0);
             const budget = Number(getSettings().budgetTokens) || defaultSettings.budgetTokens;
             const $core = $('<div class="jev-panel-core">');
             $core.append($('<div class="jev-panel-core-title">').text(
-                `⭐ 코어 메모리 ${coreEntries.length}개 · 합계 ≈${coreTokens.toLocaleString()}토큰 · 주입 예산 ${budget.toLocaleString()} → 매 턴 ≈${(coreTokens + budget).toLocaleString()}토큰`));
+                `⭐ 코어 ${coreEntries.length}개 (규칙 ${coreRules.length} · 일기 ${coreDiaries.length}${coreOther.length ? ` · 기타 ${coreOther.length}` : ''}) `
+                + `· 합계 ≈${coreTokens.toLocaleString()}토큰 · 주입 예산 ${budget.toLocaleString()} → 매 턴 ≈${(coreTokens + budget).toLocaleString()}토큰`));
             $core.append($('<div class="jev-panel-muted">').text('매 턴 항상 주입돼요 (constant, Jev 판정을 거치지 않아요)'));
 
             const $coreTable = $('<table class="jev-panel-table">');
             const $coreHead = $('<tr>');
-            for (const h of ['uid', '제목', '≈토큰', '', '']) {
+            for (const h of ['구분', 'uid', '제목', '≈토큰', '', '']) {
                 $coreHead.append($('<th>').text(h));
             }
             $coreTable.append($('<thead>').append($coreHead));
             const $coreBody = $('<tbody>');
-            for (const e of coreEntries) {
+            // 표시 순서: 규칙(최상단) → 일기(오래된→최신) → 기타(수동 승격분, 옛 단일 코어 등)
+            const coreRows = [
+                ...coreRules.map(e => ({ e, kind: '📏 규칙' })),
+                ...coreDiaries.map(e => ({ e, kind: isDiarySealed(e) ? '📔 일기 · 봉인' : '📖 일기 · 열림' })),
+                ...coreOther.map(e => ({ e, kind: '' })),
+            ];
+            for (const { e, kind } of coreRows) {
                 const content = String(e.content ?? '');
                 const $tr = $('<tr>');
+                $tr.append($('<td>').text(kind));
                 $tr.append($('<td>').text(e.uid));
                 $tr.append($('<td class="jev-cell-title">').text(String(e.comment || `uid ${e.uid}`).slice(0, 48)));
                 $tr.append($('<td>').text(approxTokens(content)));
                 $tr.append(buildCoreToggle(world, e.uid, true, $panel));
 
-                const { $cell, $detail } = buildDetailToggle(content, 5);
+                const { $cell, $detail } = buildDetailToggle(content, 6);
                 $tr.append($cell);
                 $coreBody.append($tr).append($detail);
             }
@@ -2431,7 +2778,7 @@ async function openDetailPanel() {
             $('<p>').text('직전 변환을 되돌릴까요?'),
             $('<ul>').append(
                 $('<li>').text(`추가된 항목 ${Number(snap.incidentCount) || 0}건 삭제`),
-                $('<li>').text('코어 메모리를 변환 전 본문으로 복원'),
+                $('<li>').text('코어 규칙·일기를 변환 전 상태로 복원'),
                 $('<li>').text('변환 지점·작중 앵커 되돌림 (그 구간을 다시 변환할 수 있게 돼요)'),
                 $('<li>').text('숨긴 원본 메시지 복구'),
                 $('<li>').text('로어북 재색인 (임베딩 호출이 발생해요)'),
@@ -2445,7 +2792,7 @@ async function openDetailPanel() {
         $button.addClass('disabled');
         try {
             const r = await undoLastConversion(setConvertStatus);
-            setConvertStatus(`되돌리기 완료: 항목 ${r.removed}개 삭제 · ${r.coreNote} · 메시지 ${r.unhidden}개 복구 · ${r.indexed}개 재색인`);
+            setConvertStatus(`되돌리기 완료: 항목 ${r.removed}개 삭제 · ${r.rulesNote} · ${r.diaryNote} · 메시지 ${r.unhidden}개 복구 · ${r.indexed}개 재색인`);
             toastr.success(`되돌렸어요 — 항목 ${r.removed}개 삭제, 메시지 ${r.unhidden}개 복구`, 'Jev Lorebook');
         } catch (error) {
             setConvertStatus(`되돌리기 실패: ${error?.message ?? error}`);
