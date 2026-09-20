@@ -439,3 +439,63 @@
     opacity: 0.85;
     font-size: 0.92em;
 }
+
+/* ── 로어 4계층 (v0.8.0) ───────────────────────────────────────────────
+   ST 본체와 같은 4층(채팅/캐릭터/전역/페르소나)을 감지하므로 북이 여러 개 섞인다.
+   어느 북의 어느 층인지가 한눈에 안 보이면 표가 통째로 읽히지 않는다. */
+
+.jev-layer-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 4px;
+}
+
+.jev-layer-summary {
+    font-size: 0.9em;
+    opacity: 0.75;
+}
+
+.jev-layer-row {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 0.9em;
+}
+
+.jev-layer-name {
+    word-break: break-all;
+}
+
+.jev-layer-meta {
+    opacity: 0.65;
+}
+
+.jev-layer-badge {
+    display: inline-block;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.4));
+    border-radius: 4px;
+    padding: 0 5px;
+    margin-right: 6px;
+    font-size: 0.85em;
+    opacity: 0.85;
+    white-space: nowrap;
+}
+
+/* 판정 표 북별 그룹 헤더 — '월드' 칸을 없앤 자리를 대신한다 */
+.jev-panel-table tr.jev-panel-group-row > td {
+    background-color: rgba(128, 128, 128, 0.14);
+    font-weight: bold;
+    white-space: normal;
+}
+
+.jev-group-name {
+    word-break: break-all;
+}
+
+.jev-group-meta {
+    margin-left: 8px;
+    font-weight: normal;
+    opacity: 0.7;
+}

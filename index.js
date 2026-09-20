@@ -17,9 +17,10 @@
 import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { eventSource, event_types } from '../../../events.js';
 import { extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
-import { world_names, loadWorldInfo, METADATA_KEY, createWorldInfoEntry, saveWorldInfo, newWorldInfoEntryTemplate, updateWorldInfoList, reloadEditor } from '../../../world-info.js';
+import { world_names, loadWorldInfo, METADATA_KEY, createWorldInfoEntry, saveWorldInfo, newWorldInfoEntryTemplate, updateWorldInfoList, reloadEditor, selected_world_info, world_info } from '../../../world-info.js';
+import { power_user } from '../../../power-user.js';
 import { getTokenCountAsync } from '../../../tokenizers.js';
-import { getStringHash, timestampToMoment } from '../../../utils.js';
+import { getStringHash, timestampToMoment, getCharaFilename } from '../../../utils.js';
 import { callGenericPopup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { secret_state, SECRET_KEYS } from '../../../secrets.js';
 import { ConnectionManagerRequestService } from '../../shared.js';
@@ -186,6 +187,11 @@ const DEFAULT_INCIDENT_MAX_TOKENS = 500;
 
 const defaultSettings = Object.freeze({
     enabled: false,
+    // 감지 대상 층 on/off (v0.8.0) — ST 본체 4계층. 전부 기본 켜짐.
+    layerChat: true,
+    layerChar: true,
+    layerGlobal: true,
+    layerPersona: true,
     jevApiKey: '',
     budgetTokens: 4000,
     world: '',
@@ -243,29 +249,92 @@ function getSettings() {
 }
 
 /**
- * 대상 로어북 결정 (v0.2): 고정 오버라이드가 없으면 **이 채팅/캐릭터에 물린 로어북만** 쓴다.
- * 전역 1개 고정은 다른 채팅에 남의 기억이 새는 구조라 기각 (2026-09-20 현이 지적).
+ * 감지 대상 로어북 (v0.8.0): ST 본체 4계층을 그대로 미러링한다.
+ * v0.2~v0.7은 채팅 바인딩 + 캐릭터 카드 2계층만 봤다 — 빠진 2층(전역·페르소나)은 확장의 선별·예산 밖에서
+ * ST가 매 턴 통짜로 native 주입해 버린다 = 선별 우회.
+ * 귀속 순서는 world-info.js의 skip 로직과 동일: 채팅 > 페르소나 > 캐릭터 > 전역
+ * (getChatLore:4432 / getPersonaLore:4452 / getCharacterLore:4363 — 상위 층에 이미 있으면 건너뛴다).
+ * ⚠ 여기는 **읽기 대상**이다. 쓰기(챗 → 로어북 변환) 저장처는 getConversionTargetWorld() 단독.
  */
-function getTargetWorlds() {
+const LAYER_LABELS = Object.freeze({
+    fixed: '고정',
+    chat: '채팅',
+    persona: '페르소나',
+    character: '캐릭터',
+    global: '전역',
+});
+
+/**
+ * 캐릭터 카드에 물린 로어북 — ST getCharacterLore(world-info.js:4363) 미러.
+ * 카드의 data.extensions.world 말고도 world_info.charLore(추가 로어북, 파일명 키) 경로가 있다.
+ */
+function getCharacterCardWorlds(ctx) {
+    const out = [];
+    const base = ctx?.characters?.[ctx?.characterId]?.data?.extensions?.world;
+    if (base && typeof base === 'string') out.push(base);
+    try {
+        const fileName = getCharaFilename(ctx?.characterId);
+        const extra = fileName ? (world_info?.charLore ?? []).find(e => e?.name === fileName) : null;
+        for (const name of (extra?.extraBooks ?? [])) {
+            if (name && typeof name === 'string') out.push(name);
+        }
+    } catch (error) {
+        console.log(`${LOG} charLore 조회 실패 — 카드 기본 북만 사용: ${error?.message ?? error}`);
+    }
+    return out;
+}
+
+/** 감지 대상 로어북 상세 — [{name, layer}]. UI는 이쪽을 쓴다 */
+function getTargetWorldsDetailed() {
     const settings = getSettings();
-    if (settings.world) return (world_names ?? []).includes(settings.world) ? [settings.world] : [];
+    const known = new Set(world_names ?? []);
+    if (settings.world) {
+        return known.has(settings.world) ? [{ name: settings.world, layer: 'fixed' }] : [];
+    }
     const ctx = SillyTavern.getContext();
     const found = [];
-    const chatWorld = ctx.chatMetadata?.[METADATA_KEY];                                // 채팅에 물린 로어북
-    const charWorld = ctx.characters?.[ctx.characterId]?.data?.extensions?.world;      // 캐릭터 카드 로어북
-    for (const w of [chatWorld, charWorld]) {
-        if (w && typeof w === 'string' && !found.includes(w) && (world_names ?? []).includes(w)) {
-            found.push(w);
-        }
+    const seen = new Set();
+    // 실존 북만 채택(world_names 방어) + 같은 북은 먼저 걸린 층에 한 번만 귀속
+    const push = (name, layer) => {
+        if (!name || typeof name !== 'string') return;
+        if (seen.has(name) || !known.has(name)) return;
+        seen.add(name);
+        found.push({ name, layer });
+    };
+    if (settings.layerChat !== false) push(ctx.chatMetadata?.[METADATA_KEY], 'chat');
+    if (settings.layerPersona !== false) push(power_user?.persona_description_lorebook, 'persona');
+    if (settings.layerChar !== false) {
+        for (const name of getCharacterCardWorlds(ctx)) push(name, 'character');
+    }
+    if (settings.layerGlobal !== false) {
+        for (const name of (selected_world_info ?? [])) push(name, 'global');
     }
     return found;
 }
 
-/** 변환 대상 로어북 1개: 고정 오버라이드 > 채팅에 물린 것 > 캐릭터 카드 순 */
+/** 감지 대상 로어북 이름만 — 기존 호출부가 문자열 배열을 기대한다 (시그니처 불변) */
+function getTargetWorlds() {
+    return getTargetWorldsDetailed().map(d => d.name);
+}
+
+/**
+ * 변환(챗 → 로어북) 저장처 1개. getTargetWorlds()와 **독립 구현**이다.
+ * 우선순위: 설정 고정 > 캐릭터 카드 북 > 채팅 바인딩 북.
+ * ⚠ 전역·페르소나는 어떤 경우에도 반환하지 않는다 — 전역 북에 사건이 쌓이면 모든 채팅으로 샌다.
+ * 카드 북이 없으면 채팅 북으로 폴백한다: 발주자 캐릭터 183장 중 카드에 북이 박힌 건 44장뿐이라
+ * 폴백이 없으면 대부분의 채팅에서 변환이 죽는다.
+ */
 function getConversionTargetWorld() {
     const settings = getSettings();
-    if (settings.world) return (world_names ?? []).includes(settings.world) ? settings.world : '';
-    return getTargetWorlds()[0] ?? '';
+    const known = new Set(world_names ?? []);
+    if (settings.world) return known.has(settings.world) ? settings.world : '';
+    const ctx = SillyTavern.getContext();
+    for (const name of getCharacterCardWorlds(ctx)) {
+        if (known.has(name)) return name;
+    }
+    const chatWorld = ctx.chatMetadata?.[METADATA_KEY];
+    if (chatWorld && typeof chatWorld === 'string' && known.has(chatWorld)) return chatWorld;
+    return '';
 }
 
 // ── ST 벡터 API (서버 경유, 임베딩 = Gemini/MakerSuite 키) ──────────────
@@ -637,10 +706,10 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
             return;
         }
 
-        // 대상 로어북: 이 채팅/캐릭터에 물린 것만 (전역 오염 방지)
+        // 대상 로어북: 켜진 층에서 감지된 것 전부 (v0.8.0 — ST 본체와 같은 4계층)
         const worlds = getTargetWorlds();
         if (!worlds.length) {
-            console.log(`${LOG} 이 채팅/캐릭터에 물린 로어북 없음 — 건너뜀 (특정 로어북을 강제하려면 설정의 고정 대상)`);
+            console.log(`${LOG} 켜진 층에서 감지된 로어북 없음 — 건너뜀 (특정 로어북을 강제하려면 설정의 고정 대상)`);
             return;
         }
 
@@ -811,7 +880,7 @@ async function indexLorebook() {
     const settings = getSettings();
     const worlds = getTargetWorlds();
     if (!worlds.length) {
-        toastr.warning('색인할 대상이 없어요. 이 채팅/캐릭터에 로어북을 연결하거나, 설정에서 고정 대상을 선택해 주세요.', 'Jev Lorebook');
+        toastr.warning('색인할 대상이 없어요. 채팅·캐릭터·전역·페르소나 중 한 곳에 로어북을 연결하거나, 설정에서 고정 대상을 선택해 주세요.', 'Jev Lorebook');
         return;
     }
 
@@ -1494,7 +1563,7 @@ async function runSplitForWorld(world, uids, setStatus) {
 async function openSplitDialog(setStatus, $panel) {
     const worlds = getTargetWorlds();
     if (!worlds.length) {
-        toastr.error('대상 로어북이 없어요. 이 채팅/캐릭터에 로어북을 연결하거나 고정 대상을 설정해 주세요.', 'Jev Lorebook');
+        toastr.error('대상 로어북이 없어요. 채팅·캐릭터·전역·페르소나 중 한 곳에 로어북을 연결하거나 고정 대상을 설정해 주세요.', 'Jev Lorebook');
         return;
     }
 
@@ -1596,7 +1665,8 @@ async function openSplitDialog(setStatus, $panel) {
 function renderPanelSummary($panel) {
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
-    const worlds = getTargetWorlds();
+    const detailed = getTargetWorldsDetailed();
+    const worlds = detailed.map(d => d.name);
     const convertWorld = getConversionTargetWorld();
     const chatLength = (ctx.chat ?? []).length;
     const converted = Math.max(0, Number(ctx.chatMetadata?.[CONVERT_META_KEY]) || 0);
@@ -1606,7 +1676,9 @@ function renderPanelSummary($panel) {
         .append($('<span class="jev-panel-label">').text(label))
         .append($('<span>').text(value));
     $summary.append(row('상태', settings.enabled ? '켜짐' : '꺼짐'));
-    $summary.append(row('대상 로어북', worlds.length ? `${settings.world ? '고정' : '자동'}: ${worlds.join(', ')}` : '없음 (채팅/캐릭터에 연결된 로어북이 없어요)'));
+    $summary.append(row('대상 로어북', detailed.length
+        ? `${detailed.length}개 — ` + detailed.map(d => `${d.name} (${LAYER_LABELS[d.layer] ?? d.layer})`).join(', ')
+        : '없음 (채팅·캐릭터·전역·페르소나 어디에도 연결된 로어북이 없어요)'));
     $summary.append(row('턴당 예산', `${Number(settings.budgetTokens) || defaultSettings.budgetTokens}토큰`));
     $summary.append(row('전송', jevTransport ? jevTransport.label : (lastTransportError ? `없음 — ${lastTransportError}` : '미감지 (첫 생성 때 자동으로 감지해요)')));
     const embedMeta = EMBEDDING_SOURCES[settings.embeddingSource] ?? EMBEDDING_SOURCES.palm;
@@ -1695,7 +1767,7 @@ async function fillStackTokens($slots, chat, from, to, keepRecent, chatLength) {
     }
 }
 
-/** 직전 턴 판정 리포트 렌더 */
+/** 직전 턴 판정 리포트 렌더 — 북별 그룹 헤더로 묶는다 (v0.8.0: 4계층이라 여러 북이 섞인다) */
 function renderPanelJudgment($panel) {
     const $box = $panel.find('#jev_panel_judgment').empty();
 
@@ -1709,32 +1781,52 @@ function renderPanelJudgment($panel) {
 
     const meta = `${new Date(lastReport.ts).toLocaleTimeString()} · type=${lastReport.type} · 후보 ${lastReport.candidateCount} → 채택 ${lastReport.adoptedCount} · ${lastReport.usedTokens}토큰 · ${lastReport.ms}ms`
         + (lastReport.cacheHits ? ` · 캐시 재사용 ${lastReport.cacheHits}회` : '')
-        + ` — 대상: ${lastReport.worlds.join(', ')}`;
+        + ` — 대상 ${lastReport.worlds.length}개: ${lastReport.worlds.join(', ')}`;
     $box.append($('<div class="jev-panel-muted">').text(meta));
 
+    // '월드' 칸을 없애고 그룹 헤더로 올렸다 — 16자로 잘린 칸으로는 북이 여럿일 때 분간이 안 된다.
+    const headers = ['채택', 'uid', '제목', '모순위험', '장면적합', '최근중복', '최종', '토큰', ''];
     const $table = $('<table class="jev-panel-table">');
     const $thead = $('<tr>');
-    for (const h of ['채택', '월드', 'uid', '제목', '모순위험', '장면적합', '최근중복', '최종', '토큰', '']) {
+    for (const h of headers) {
         $thead.append($('<th>').text(h));
     }
     $table.append($('<thead>').append($thead));
     const $tbody = $('<tbody>');
-    for (const r of lastReport.rows) {
-        const $tr = $('<tr>').toggleClass('jev-adopted', r.adopted);
-        $tr.append($('<td>').text(r.adopted ? '✓' : ''));
-        $tr.append($('<td>').text(String(r.world).slice(0, 16)));
-        $tr.append($('<td>').text(r.uid));
-        $tr.append($('<td class="jev-cell-title">').text(String(r.title).slice(0, 48)));
-        $tr.append($('<td>').text(r.contradiction.toFixed(2)));
-        $tr.append($('<td>').text(r.sceneFit.toFixed(2)));
-        $tr.append($('<td>').text(r.duplicate.toFixed(2)));
-        $tr.append($('<td>').text(r.final.toFixed(3)));
-        $tr.append($('<td>').text(r.tokens ?? '—'));
 
-        // 전문 펼치기(v0.6.4) — 점수만 보고는 왜 뻐졌는지 몰라서 여기가 제일 많이 쓰인다.
-        const { $cell, $detail } = buildDetailToggle(r.text, 10);
-        $tr.append($cell);
-        $tbody.append($tr).append($detail);
+    const layerOf = new Map(getTargetWorldsDetailed().map(d => [d.name, d.layer]));
+    const groups = new Map();
+    for (const r of lastReport.rows) {
+        const key = String(r.world);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(r);
+    }
+
+    for (const [world, rows] of groups) {
+        const adoptedCount = rows.filter(r => r.adopted).length;
+        const $groupCell = $('<td>').attr('colspan', headers.length);
+        const layer = layerOf.get(world);
+        if (layer) $groupCell.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
+        $groupCell.append($('<span class="jev-group-name">').text(world));
+        $groupCell.append($('<span class="jev-group-meta">').text(`후보 ${rows.length}개 · 채택 ${adoptedCount}개`));
+        $tbody.append($('<tr class="jev-panel-group-row">').append($groupCell));
+
+        for (const r of rows) {
+            const $tr = $('<tr>').toggleClass('jev-adopted', r.adopted);
+            $tr.append($('<td>').text(r.adopted ? '✓' : ''));
+            $tr.append($('<td>').text(r.uid));
+            $tr.append($('<td class="jev-cell-title">').text(String(r.title).slice(0, 48)));
+            $tr.append($('<td>').text(r.contradiction.toFixed(2)));
+            $tr.append($('<td>').text(r.sceneFit.toFixed(2)));
+            $tr.append($('<td>').text(r.duplicate.toFixed(2)));
+            $tr.append($('<td>').text(r.final.toFixed(3)));
+            $tr.append($('<td>').text(r.tokens ?? '—'));
+
+            // 전문 펼치기(v0.6.4) — 점수만 보고는 왜 빠졌는지 몰라서 여기가 제일 많이 쓰인다.
+            const { $cell, $detail } = buildDetailToggle(r.text, headers.length);
+            $tr.append($cell);
+            $tbody.append($tr).append($detail);
+        }
     }
     $table.append($tbody);
     $box.append($table);
@@ -1743,7 +1835,9 @@ function renderPanelJudgment($panel) {
 /** 색인 현황 렌더 — 로어북 항목 hash를 /api/vector/list 결과와 대조 */
 async function renderPanelChunks($panel) {
     const $box = $panel.find('#jev_panel_chunks').empty();
-    const worlds = getTargetWorlds();
+    const detailed = getTargetWorldsDetailed();
+    const layerOf = new Map(detailed.map(d => [d.name, d.layer]));
+    const worlds = detailed.map(d => d.name);
     if (!worlds.length) {
         $box.append($('<div class="jev-panel-muted">').text('대상 로어북이 없어요.'));
         return;
@@ -1805,7 +1899,11 @@ async function renderPanelChunks($panel) {
             : `${world} — 항목 ${entries.length}개 / 색인 ${indexedCount}개 / 미색인 ${entries.length - indexedCount}개`
               + (indexedHashes ? ` (벡터 저장소 ${indexedHashes.size}건)` : '')
               + (disabledCount ? ` · 비활성/빈 항목 ${disabledCount}개 제외` : '');
-        $section.append($('<div class="jev-panel-world-title">').text(headline));
+        const $worldTitle = $('<div class="jev-panel-world-title">');
+        const layer = layerOf.get(world);
+        if (layer) $worldTitle.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
+        $worldTitle.append($('<span>').text(headline));
+        $section.append($worldTitle);
         $section.append($('<div class="jev-panel-muted">').text(
             '🔵 = 상시 메모리(매 턴 주입) · 🟢 = 검색층 / 누르면 전환할 수 있습니다.'));
 
@@ -2065,10 +2163,66 @@ async function fillTopKTotal() {
     }
 }
 
+/**
+ * 설정탭 '대상 로어북' — 지금 감지된 북 목록 (v0.8.0).
+ * 후보 수 상한은 두지 않기로 했으므로(발주자 결정) 대신 북 개수·총 항목 수를 보여준다.
+ * 로어북 로드·색인 대조가 있어 비동기 — fillTopKTotal과 같은 패턴으로 렌더를 막지 않는다.
+ */
+let layerListRun = 0;
+async function renderLayerList() {
+    const run = ++layerListRun;
+    const $box = $('#jev_lorebook_layer_list');
+    if (!$box.length) return;
+    const detailed = getTargetWorldsDetailed();
+    $box.empty();
+    if (!detailed.length) {
+        $box.append($('<div class="jev-layer-summary">').text('지금 감지된 로어북이 없어요.'));
+        return;
+    }
+    const $summary = $('<div class="jev-layer-summary">').text(`북 ${detailed.length}개 · 총 …항목`);
+    $box.append($summary);
+
+    let totalEntries = 0;
+    for (const { name, layer } of detailed) {
+        const $row = $('<div class="jev-layer-row">');
+        $row.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
+        $row.append($('<span class="jev-layer-name">').text(name));
+        const $meta = $('<span class="jev-layer-meta">').text('확인 중…');
+        $row.append($meta);
+        $box.append($row);
+
+        try {
+            const worldData = await loadWorldInfo(name);
+            if (run !== layerListRun) return; // 그 사이 다시 렌더됨 — 옛 결과를 덮어쓰지 않는다
+            const live = Object.values(worldData?.entries ?? {})
+                .filter(e => !e.disable && String(e.content ?? '').trim());
+            totalEntries += live.length;
+            // 코어(constant)는 ST가 매 턴 네이티브 주입 = 색인 대상이 아니다
+            const indexTargets = live.filter(e => !e.constant);
+            let indexText = '색인 확인 실패';
+            try {
+                const hashes = await vectorList(name);
+                if (run !== layerListRun) return;
+                const done = indexTargets.filter(e => hashes.has(Number(getStringHash(String(e.content ?? ''))))).length;
+                indexText = indexTargets.length
+                    ? `색인 ${done >= indexTargets.length ? '✓' : '✗'} ${done}/${indexTargets.length}`
+                    : '색인 대상 없음';
+            } catch (error) {
+                indexText = `색인 확인 실패 (${error?.message ?? error})`;
+            }
+            $meta.text(`${live.length}항목 · ${indexText}`);
+        } catch (error) {
+            $meta.text(`읽기 실패: ${error?.message ?? error}`);
+        }
+        if (run !== layerListRun) return;
+        $summary.text(`북 ${detailed.length}개 · 총 ${totalEntries}항목`);
+    }
+}
+
 function populateWorldSelect() {
     const settings = getSettings();
     const $select = $('#jev_lorebook_world');
-    $select.empty().append('<option value="">— 자동: 이 채팅/캐릭터에 연결된 로어북 —</option>');
+    $select.empty().append('<option value="">— 자동: 위에서 켠 층의 로어북 —</option>');
     for (const name of (world_names ?? [])) {
         $select.append($('<option>').val(name).text(name));
     }
@@ -2099,6 +2253,7 @@ jQuery(async () => {
     $('#jev_lorebook_world').on('change', function () {
         settings.world = String($(this).val());
         saveSettingsDebounced();
+        void renderLayerList();
         void fillTopKTotal(); // 대상이 바뀌면 '전체 N개'도 따라가야 한다
     });
 
@@ -2120,6 +2275,7 @@ jQuery(async () => {
     });
     $('#jev_lorebook_topk_value').text(String(getQueryTopK()));
     void fillTopKTotal();
+    void renderLayerList();
 
     $('#jev_lorebook_slice_tokens').val(getSliceTokens()).on('input', function () {
         settings.sliceTokens = clampSetting($(this).val(), SLICE_TOKENS_MIN, SLICE_TOKENS_MAX, DEFAULT_SLICE_TOKENS);
@@ -2176,9 +2332,28 @@ jQuery(async () => {
         saveSettingsDebounced();
     });
 
+    // 감지 대상 층 on/off (v0.8.0) — 전부 기본 켜짐. 끄면 그 층의 북이 감지 목록에서 빠진다.
+    const LAYER_INPUTS = {
+        layerChat: '#jev_lorebook_layer_chat',
+        layerChar: '#jev_lorebook_layer_char',
+        layerGlobal: '#jev_lorebook_layer_global',
+        layerPersona: '#jev_lorebook_layer_persona',
+    };
+    for (const [key, selector] of Object.entries(LAYER_INPUTS)) {
+        $(selector).prop('checked', settings[key] !== false).on('change', function () {
+            settings[key] = !!$(this).prop('checked');
+            saveSettingsDebounced();
+            void renderLayerList();
+            void fillTopKTotal(); // 대상이 바뀌면 '전체 N개'도 따라가야 한다
+        });
+    }
+
     populateWorldSelect();
     if (event_types.WORLDINFO_UPDATED) {
-        eventSource.on(event_types.WORLDINFO_UPDATED, populateWorldSelect);
+        eventSource.on(event_types.WORLDINFO_UPDATED, () => {
+            populateWorldSelect();
+            void renderLayerList();
+        });
     }
 
     // 요술봉(#extensionsMenu) 항목 — 세부 조정은 여기서 (큰 분류는 확장 탭 서랍)
