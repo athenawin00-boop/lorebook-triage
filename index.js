@@ -63,6 +63,31 @@ const DEFAULT_SLICE_TOKENS = 18000; // 슬라이스당 대화 토큰 상한 기�
 const REAL_GAP_HOURS = 6;           // 실제 시간이 이만큼 벌어지면 전사에 장면 경계 힌트를 남긴다 (약한 힌트일 뿐)
 const CORE_COMMENT = '⭐ Core Memory';   // 코어 메모리 항목 식별자 (comment 고정 = upsert 키)
 
+// ── 본문 날짜 헤더 (v0.12.0) ────────────────────────────────────────────
+// ST는 주입 조립에 entry.content만 넣는다 (world-info.js:5095 `WIBeforeEntries.unshift(content)`).
+// comment(제목)는 편집창·내보내기 전용이라 프롬프트에 절대 닿지 않는다 → v0.11.0까지 저장된 항목은
+// 날짜가 comment에만 있어서 ① 모델이 사건 순서를 못 읽고 ② content만 임베딩하니 시기 쿼리 회수도 안 됐다.
+// 변환 출력 헤더(`### YYYY-MM-DD — 제목`)와 같은 형식으로 본문 머리에 박아 왕복 구조를 일치시킨다.
+const INCIDENT_HEADER_RE = /^#{2,4}\s*\d{4}-\d{2}-\d{2}/;
+// comment 형식 `제목 · YYYY-MM-DD[ #N]` 역파싱 — 마이그레이션이 날짜·제목을 여기서 긁는다
+const COMMENT_META_RE = /^(.*?)\s*·\s*(\d{4}-\d{2}-\d{2})(?:\s*#\s*\d+)?\s*$/;
+// 날짜가 두 번 박힌 레거시 comment가 실재한다 — `ㅅㅃㄹ 1 · 2025-01-18 · 2025-01-18` (v0.4 스플릿 산물, 2026-09-20 실측 4건).
+// 그대로 두면 헤더가 `### 2025-01-18 — ㅅㅃㄹ 1 · 2025-01-18`로 나온다 → 제목 꼬리의 날짜를 전부 벗긴다.
+const COMMENT_DATE_TAIL_RE = /\s*·\s*\d{4}-\d{2}-\d{2}(?:\s*#\s*\d+)?\s*$/;
+
+/** comment에서 제목만 — 말미에 붙은 날짜 꼬리를 남지 않을 때까지 벗긴다 */
+function stripDateTail(title) {
+    let out = String(title ?? '').trim();
+    let prev;
+    do { prev = out; out = out.replace(COMMENT_DATE_TAIL_RE, '').trim(); } while (out !== prev);
+    return out;
+}
+
+/** 사건 항목 본문 = 날짜 헤더 + 본문. 저장·주입·임베딩이 전부 이 문자열 하나를 쓴다 */
+function buildIncidentContent(date, title, body) {
+    return `### ${date} — ${title}\n${body}`;
+}
+
 // ── 스플릿(v0.4) 상수 — st_lorebook_split.py 규칙의 JS 이식 ─────────────────
 // 줄머리 20자 이내 날짜 = 경계. $ 앵커 금지 — 엄격 버전은 헤더 뒤 본문 붙은 항목을 통짜로 남겼다 (실측, §4-10)
 const SPLIT_DATE_RE = /^[^\S\n]*(?:#{1,4}[^\S\n]*)?(?:\*\*)?[^\n]{0,20}?(\d{4}-\d{2}-\d{2})/gm;
@@ -229,6 +254,8 @@ const defaultSettings = Object.freeze({
     incidentMaxTokens: DEFAULT_INCIDENT_MAX_TOKENS, // 사건 1건당 토큰 상한 (프롬프트에 주입)
     queryTopK: DEFAULT_TOP_K,                   // 벡터 회수 후보 수
     convertStyle: '',                           // 빈 값 = DEFAULT_CONVERT_STYLE 사용
+    // ── v0.12.0 신규 ──
+    headerMigratedWorlds: [],                   // 본문 날짜 헤더 마이그레이션이 끝난 로어북 이름 (로어북당 1회용 마커)
 });
 
 /** 설정 숫자 방어 — 설정 파일이 손으로 망가졌어도 파이프라인은 돌아가야 한다 */
@@ -1469,7 +1496,8 @@ async function convertChatToLorebook(setStatus) {
             entry.key = [];
             // 1번째엔 번호를 안 붙인다 — 하루에 사건이 하나뿐인 날이 대부분이라 '#1'은 소음이다
             entry.comment = `${inc.title} · ${inc.date}${n > 1 ? ` #${n}` : ''}`;
-            entry.content = inc.body;
+            // 본문 머리에 날짜 헤더 (v0.12.0) — comment는 프롬프트에 안 들어간다
+            entry.content = buildIncidentContent(inc.date, inc.title, inc.body);
             entry.constant = false;
             entry.disable = false;
         }
@@ -1562,6 +1590,77 @@ async function convertChatToLorebook(setStatus) {
         toastr.error(`변환에 실패했어요: ${error?.message ?? error}`, 'Jev Lorebook');
     } finally {
         conversionInProgress = false;
+    }
+}
+
+// ── 본문 날짜 헤더 마이그레이션 (v0.12.0) ──────────────────────────────
+
+/**
+ * 기존 항목 본문 머리에 날짜 헤더를 박는다 (로어북 1개 단위).
+ * v0.11.0까지 저장된 항목은 날짜가 comment에만 있어 프롬프트·임베딩 어느 쪽에도 닿지 않았다.
+ * 안전장치 3개: ① constant(코어)는 날짜 개념이 없어 제외 ② 이미 헤더가 있으면 건너뜀(재실행 안전)
+ * ③ comment가 우리 형식(`제목 · YYYY-MM-DD`)이 아니면 손대지 않는다(사용자가 손으로 쓴 항목 보호).
+ * @returns {Promise<number>} 헤더를 붙인 항목 수
+ */
+async function migrateContentHeaders(world) {
+    const worldData = await loadWorldInfo(world);
+    const entries = Object.values(worldData?.entries ?? {});
+    if (!entries.length) return 0;
+
+    let patched = 0;
+    for (const entry of entries) {
+        if (entry.constant || entry.comment === CORE_COMMENT) continue;
+        const body = String(entry.content ?? '');
+        if (!body.trim()) continue;
+        if (INCIDENT_HEADER_RE.test(body)) continue;
+        const meta = String(entry.comment ?? '').match(COMMENT_META_RE);
+        if (!meta) continue;
+        entry.content = buildIncidentContent(meta[2], stripDateTail(meta[1]) || '(무제)', body);
+        patched++;
+    }
+    if (patched) await saveWorldInfo(world, worldData, true);
+    return patched;
+}
+
+/**
+ * 대상 로어북 자동 마이그레이션 — 채팅이 열릴 때 로어북당 1회.
+ * 본문이 바뀜으니 임베딩도 같이 갱신해야 한다 — 재색인까지 돌려야 끝난 것이다.
+ * 재색인만 실패하면 embeddingDirty로 수동 색인을 유도한다(본문은 이미 고쳐졌으니 재실행해도 둘째 번째는 건너뀜).
+ */
+async function runHeaderMigration() {
+    const settings = getSettings();
+    if (!Array.isArray(settings.headerMigratedWorlds)) settings.headerMigratedWorlds = [];
+    const done = new Set(settings.headerMigratedWorlds);
+    const targets = getTargetWorlds().filter(w => !done.has(w));
+    if (!targets.length) return;
+
+    let changed = false;
+    for (const world of targets) {
+        try {
+            const patched = await migrateContentHeaders(world);
+            done.add(world);
+            changed = true;
+            if (!patched) {
+                console.log(`${LOG} 본문 날짜 헤더 마이그레이션: ${world} — 대상 없음`);
+                continue;
+            }
+            console.log(`${LOG} 본문 날짜 헤더 마이그레이션: ${world} → ${patched}개 항목`);
+            try {
+                const indexed = await indexWorld(world);
+                toastr.info(`'${world}' 항목 ${patched}개 본문에 날짜 헤더를 넣고 재색인했어요 (${indexed}개).`, 'Jev Lorebook');
+            } catch (error) {
+                settings.embeddingDirty = true;
+                console.warn(`${LOG} '${world}' 마이그레이션 후 재색인 실패: ${error?.message ?? error}`);
+                toastr.warning(`'${world}' 날짜 헤더는 넣었는데 재색인이 실패했어요. 설정에서 [색인]을 한 번 눌러주세요: ${error?.message ?? error}`, 'Jev Lorebook');
+            }
+        } catch (error) {
+            // 마커를 안 찍고 넘어간다 — 다음 채팅 전환 때 다시 시도한다
+            console.warn(`${LOG} '${world}' 헤더 마이그레이션 실패 — 다음 기회에 재시도: ${error?.message ?? error}`);
+        }
+    }
+    if (changed) {
+        settings.headerMigratedWorlds = [...done];
+        saveSettingsDebounced();
     }
 }
 
@@ -2738,6 +2837,16 @@ jQuery(async () => {
     }
 
     populateWorldSelect();
+
+    // 본문 날짜 헤더 자동 마이그레이션 (v0.12.0) — 채팅이 바뀔 때마다 대상 로어북을 보고 아직 안 한 것만 처리.
+    // 확장 로드 시점엔 이미 채팅이 열려 있을 수 있어 CHAT_CHANGED가 안 온다 → 여기서 1회 직접 돌린다.
+    if (event_types.CHAT_CHANGED) {
+        eventSource.on(event_types.CHAT_CHANGED, () => { void runHeaderMigration(); });
+    } else {
+        console.warn(`${LOG} event_types.CHAT_CHANGED가 없다 — 헤더 마이그레이션은 로드 시 1회만 돌아간다`);
+    }
+    void runHeaderMigration();
+
     if (event_types.WORLDINFO_UPDATED) {
         eventSource.on(event_types.WORLDINFO_UPDATED, () => {
             populateWorldSelect();
