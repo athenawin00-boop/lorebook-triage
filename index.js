@@ -45,7 +45,6 @@ const DEFAULT_TOP_K = 30;        // 벡터 회수 후보 수 기본값 — 20으
 const TOP_K_MIN = 20;
 const TOP_K_MAX = 50;
 const SCORE_FLOOR = 0.5;         // 최종 점수 하한. 대조실험 눈금: 0.74=빼면 모순 / 0.52=장면만 맞음 / 0.37=무관
-const MAX_ADOPTED = 3;          // Jev 채택 개수 상한 (v0.9.0, 고정 상수 — 설정 노출 안 함). budgetTokens·SCORE_FLOOR와 동시 적용, 먼저 걸리는 쪽이 이긴다
 const QUERY_USER_MESSAGES = 3;   // 검색 쿼리로 쓸 최근 유저 메시지 수
 const SCENE_MESSAGES = 6;        // Jev에 보여줄 최근 장면 메시지 수
 const INSERT_CHUNK = 20;         // 색인 시 insert 배치 크기
@@ -803,11 +802,10 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         let usedTokens = 0;
         for (const item of ranked) {
             if (item.final < SCORE_FLOOR) break; // 정렬됐으니 이후는 전부 하한 미만
-            // v0.9.0 개수 상한 — 키워드 발동은 상한 없이 ST가 알아서 돌고(확장 예산 밖),
-            // Jev 몫만 MAX_ADOPTED개로 조인다. ST WI 총예산은 기본 25% × max_context(90,000)
-            // ≈ 22,500이라, Jev를 3개로 줄여두면 키워드가 많이 걸리는 턴에도 총량이 안 터진다.
-            // 정렬이 점수 내림차순이므로 상한 도달 = 이후는 볼 것도 없다 → break.
-            if (adopted.length >= MAX_ADOPTED) break;
+            // v0.9.4 — 개수 상한을 없앰다. 컷은 SCORE_FLOOR와 budgetTokens 둘뿐이다.
+            // v0.9.0에서 3개로 조였던 근거("Jev 몫을 줄여야 ST 총예산이 안 터진다")는
+            // 틀린 전제였다 — v0.9.3 전까지 Jev 주입은 실효 0이라 부하를 겪어본 적이 없다.
+            // 발주자 확정(2026-09-20): 키워드 발동과 별개로 Jev는 설정 상한 토큰까지 다 채운다.
             const tokens = await getTokenCountAsync(item.text);
             if (usedTokens + tokens > budget) continue; // 남은 예산에 드는 다음 후보 탐색
             usedTokens += tokens;
