@@ -30,6 +30,23 @@
             <div id="jev_lorebook_key_help" class="jev-key-help" style="display: none;"></div>
             <small class="jev-lorebook-status">Gemini(Google AI Studio)를 추천해요 — 무료 등급으로 충분해요.</small>
 
+            <div id="jev_lorebook_embed_key_mode_row" class="jev-key-mode-row" style="display: none;">
+                <label class="radio_label">
+                    <input type="radio" name="jev_lorebook_embed_key_mode" id="jev_lorebook_embed_key_mode_shared" value="shared" />
+                    <span>ST 저장 키 사용 (기존, 기본값)</span>
+                </label>
+                <label class="radio_label">
+                    <input type="radio" name="jev_lorebook_embed_key_mode" id="jev_lorebook_embed_key_mode_dedicated" value="dedicated" />
+                    <span>전용 키 직접 입력</span>
+                </label>
+            </div>
+            <div id="jev_lorebook_embed_dedicated_key_row" style="display: none;">
+                <label for="jev_lorebook_embed_dedicated_key">전용 임베딩 키 (Google AI Studio)</label>
+                <input id="jev_lorebook_embed_dedicated_key" class="text_pole" type="password" autocomplete="off" placeholder="AIza..." />
+                <small class="jev-key-help-punch">⚠ 이 키는 SillyTavern 금고가 아니라 이 확장 설정에 평문으로 저장돼요.</small>
+            </div>
+            <small id="jev_lorebook_embed_key_mode_unsupported" class="jev-lorebook-status" style="display: none;">이 소스는 ST 저장 키만 지원해요.</small>
+
             <label for="jev_lorebook_embed_model">임베딩 모델</label>
             <input id="jev_lorebook_embed_model" class="text_pole" type="text" autocomplete="off" />
             <small class="jev-set-help">비우면 기본 모델. 바꾸면 [색인] 다시.</small>

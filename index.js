@@ -231,6 +231,9 @@ let lastConvertWarnings = [];
 //                        vectors/settings.html:181 실측)
 //   stSource = ST 드롭다운에 실제로 찍혀 있는 문자열 그대로. 우리 label과 다를 수 있어 따로 둔다
 //              (label엔 '(모델 고정: …)' 같은 우리 주석이 붙어 있어 그대로 안내하면 못 찾는다)
+// palm(Google AI Studio) 전용 키 모드에서 쓰는 접속지 — endpoints/google.js:14 API_MAKERSUITE와 동일 주소 (접속지는 그대로, 키만 교체된다)
+const GOOGLE_AI_STUDIO_BASE = 'https://generativelanguage.googleapis.com';
+
 const EMBEDDING_SOURCES = {
     palm:         { label: 'Google AI Studio (Gemini)', secretKey: SECRET_KEYS.MAKERSUITE, modelFromRequest: true, defaultModel: 'gemini-embedding-001', keyRoute: 'chat', stSource: 'Google AI Studio' }, // text-embedding-005는 404 — 실측
     vertexai:     { label: 'Google Vertex AI', secretKey: SECRET_KEYS.VERTEXAI, altSecretKey: SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, modelFromRequest: true, defaultModel: 'text-embedding-005', keyRoute: 'chat', stSource: 'Google Vertex AI' }, // Vertex에선 text-embedding-005가 정상 모델이다 (404는 AI Studio 한정)
@@ -281,6 +284,8 @@ const defaultSettings = Object.freeze({
     embeddingSource: 'palm',   // 기존 하드코딩(palm)과 동일한 기본값 — 동작 불변
     embeddingModel: '',        // 빈 값 = 소스별 기본 모델
     embeddingDirty: false,     // 임베딩 설정 변경 후 재색인 전 = true (경고 표시)
+    embeddingKeyMode: 'shared', // 'shared' = ST 저장 키(기존, 기본값) / 'dedicated' = 이 확장 설정에 따로 저장한 키 — palm 소스만 적용
+    embeddingDedicatedKey: '', // 전용 키 원문 — ⚠ ST 금고가 아니라 이 확장 설정에 평문 저장된다
     convertProfileId: '',      // 빈 값 = 현재 연결된 메인 API // 변환·숨김에서 제외할 최근 메시지 수 — 직전 장면은 원문으로 남아야 한다
     // ── v0.7.0 신규 ──
     sliceTokens: DEFAULT_SLICE_TOKENS,          // 슬라이스당 전사 토큰 상한
@@ -439,6 +444,14 @@ function getEmbeddingBody() {
     }
     if (source === 'palm') {
         body.api = 'makersuite'; // vectors 클라 관례 (extensions/vectors/index.js:968~970)
+        // 전용 키 모드 (v0.14.0) — ST 금고(MAKERSUITE)를 안 타고 이 확장 설정의 키를 직접 실어 보낸다.
+        // 배선(실측): endpoints/google.js:221 getGoogleApiConfig — request.body.reverse_proxy가 있으면
+        // 접속지는 그 값(여기선 GOOGLE_AI_STUDIO_BASE로 API_MAKERSUITE와 동일하게 고정)를 쓰고,
+        // 키는 금고 대신 request.body.proxy_password를 쓴다. 임베딩도 같은 함수를 타고 간다(vectors/google-vectors.js → getGoogleApiConfig).
+        if (settings.embeddingKeyMode === 'dedicated' && String(settings.embeddingDedicatedKey || '').trim()) {
+            body.reverse_proxy = GOOGLE_AI_STUDIO_BASE;
+            body.proxy_password = String(settings.embeddingDedicatedKey).trim();
+        }
     }
     // Vertex는 인증모드·리전·프로젝트를 ST 메인 API 설정에서 가져다 실어야 한다 (extensions/vectors/index.js:972~977).
     // 안 실으면 getGoogleApiConfig(endpoints/google.js:165)가 api !== 'vertexai'로 보고 AI Studio 경로로 새어나간다.
@@ -640,6 +653,7 @@ function buildJevHeaders(kind, apiKey) {
  */
 async function detectJevTransport(apiKey) {
     // 1순위: jev-proxy 서버 플러그인 — 404가 아니면 이 경로 고정
+    let pluginFailReason = '';
     try {
         const r = await fetch(JEV_PLUGIN_API, {
             method: 'POST',
@@ -650,8 +664,10 @@ async function detectJevTransport(apiKey) {
         if (r.status !== 404) {
             return { kind: 'plugin', endpoint: JEV_PLUGIN_API, label: '서버 플러그인 (jev-proxy)' };
         }
+        pluginFailReason = '라우트 미등록(HTTP 404) — 서버 플러그인이 설치 안 됨';
     } catch (error) {
-        console.log(`${LOG} 플러그인 경로 프로브 실패 — 다음 경로 시도: ${error?.message ?? error}`);
+        pluginFailReason = String(error?.message ?? error);
+        console.log(`${LOG} 플러그인 경로 프로브 실패 — 다음 경로 시도: ${pluginFailReason}`);
     }
     // 2순위: ST 내장 CORS 프록시 (config.yaml enableCorsProxy, server-main.js:258 마운트)
     let corsFailReason = '';
@@ -662,6 +678,8 @@ async function detectJevTransport(apiKey) {
             body: '{}',
             signal: AbortSignal.timeout(JEV_PROBE_TIMEOUT_MS),
         });
+        // 브라우저가 basicAuth 401을 가로채 로그인 팝업을 띄우므로 fetch 코드까지 401이 오는 일은 거의 없다(2026-09-20 실측) —
+        // 대신 타임아웃으로 나타난다(아래 catch 참조). 만에 하나 도달하는 환경 대비로 분기는 그대로 유지.
         if (r.status === 401) {
             corsFailReason = 'basicAuth 충돌(401) — Authorization을 Bearer가 덮어서 이 서버엔 플러그인만 가능';
         } else if (r.status === 404) {
@@ -670,9 +688,16 @@ async function detectJevTransport(apiKey) {
             return { kind: 'cors', endpoint: JEV_CORS_API, label: 'ST 내장 CORS 프록시 (/proxy)' };
         }
     } catch (error) {
-        corsFailReason = String(error?.message ?? error);
+        const msg = String(error?.message ?? error);
+        // basicAuth가 켜진 서버는 브라우저가 인증창을 띄우며 요청을 붙잡아 타임아웃으로만 나타난다 (2026-09-20 실측)
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError' || /timed out|timeout/i.test(msg);
+        corsFailReason = isTimeout
+            ? `타임아웃(${msg}) — 로그인(basicAuth) 서버에서 브라우저가 인증 창을 띄우며 요청을 붙잡았을 가능성 — 이 서버에선 CORS 경로 대신 플러그인 경로를 쓰세요`
+            : msg;
     }
-    throw new Error(`Jev 연결 경로가 없어요 — config.yaml의 enableCorsProxy: true(간단) 또는 jev-proxy 서버 플러그인(로그인/basicAuth 켠 서버용) 중 하나를 켜 주세요. (CORS 경로: ${corsFailReason})`);
+    const fixGuide = '해결: 확장 폴더 안 server-plugin 폴더를 SillyTavern/plugins/jev-proxy로 복사(최종 SillyTavern/plugins/jev-proxy/index.js) → config.yaml에 enableServerPlugins: true → 서버 재시작.';
+    console.error(`${LOG} 연결 경로 감지 실패 — 플러그인: ${pluginFailReason} / CORS: ${corsFailReason} / ${fixGuide}`);
+    throw new Error(`Jev 연결 경로가 없어요 (플러그인 경로: ${pluginFailReason}, CORS 경로: ${corsFailReason}). ${fixGuide}`);
 }
 
 /** 감지 결과 보장 — 캐시 있으면 재사용, 없으면 감지 후 캐시 */
@@ -1894,20 +1919,24 @@ async function convertChatToLorebook(setStatus) {
         const toastBody = `변환을 마쳤어요: 사건 ${incidents.length}건 · 메시지 ${hiddenCount}개 숨김 · 최근 ${keepRecent}개는 원문 유지 — ${world}.`;
         const toastOptions = { onclick: () => openWorldEditor(world), timeOut: 10000 };
 
-        if (!warnings.length) {
+        // 이월 검산 경고는 화면 토스트에서 완전히 뺀다 (발주자 확정, 2026-09-20) — 검산 로직 자체는 안 건드림.
+        // setStatus/콘솔/lastConvertWarnings에는 그대로 남겨 증거는 보존한다.
+        const toastWarnings = warnings.filter(w => !w.startsWith('이월 검산:'));
+
+        if (!toastWarnings.length) {
             setStatus(`완료: ${summary}`);
             toastr.success(`${toastBody} 여기를 누르면 에디터에서 바로 확인할 수 있어요.`, 'Jev Lorebook', toastOptions);
         } else {
             // 경고가 하나라도 있으면 초록불을 띄우지 않는다 — "다 잘 됐구나"로 읽히면 잘린 요약이 그대로 굳는다
             setStatus(`완료(경고 ${warnings.length}건): ${summary} — ${warnings.join(' / ')}`);
-            const warnBody = `${toastBody}\n⚠ 확인할 게 ${warnings.length}건 있어요: ${warnings.join(' / ')}`;
+            const warnBody = `${toastBody}\n⚠ 확인할 게 ${toastWarnings.length}건 있어요: ${toastWarnings.join(' / ')}`;
             if (coreFailed) {
                 toastr.error(warnBody, 'Jev Lorebook', { ...toastOptions, timeOut: 20000 });
             } else {
                 toastr.warning(warnBody, 'Jev Lorebook', { ...toastOptions, timeOut: 20000 });
             }
         }
-        console.log(`${LOG} 변환 완료 — 사건 ${incidents.length}건 / 변환 지점 ${startIndex}→${endIndex} / 숨김 ${hiddenCount}개 / 경고 ${warnings.length}건 / ${ms}ms`);
+        console.log(`${LOG} 변환 완료 — 사건 ${incidents.length}건 / 변환 지점 ${startIndex}→${endIndex} / 숨김 ${hiddenCount}개 / 경고 ${warnings.length}건 (토스트 표시 ${toastWarnings.length}건) / ${ms}ms`);
     } catch (error) {
         console.error(`${LOG} 변환 실패`, error);
         warnings.push(`변환 실패: ${error?.message ?? error}`);
@@ -2335,7 +2364,10 @@ function renderPanelSummary($panel) {
     $summary.append(row('전송', jevTransport ? jevTransport.label : (lastTransportError ? `없음 — ${lastTransportError}` : '미감지 (첫 생성 때 자동으로 감지해요)')));
     const embedMeta = EMBEDDING_SOURCES[settings.embeddingSource] ?? EMBEDDING_SOURCES.palm;
     const embedModel = embedMeta.modelFromRequest ? (String(settings.embeddingModel || '').trim() || embedMeta.defaultModel) : '(서버 고정)';
-    const embedKey = embedMeta.secretKey === null ? '키 불필요' : (hasEmbeddingKey(embedMeta) ? '키 등록됨 ✓' : '키 미등록 ✗');
+    const embedDedicated = settings.embeddingSource === 'palm' && settings.embeddingKeyMode === 'dedicated';
+    const embedKey = embedDedicated
+        ? (String(settings.embeddingDedicatedKey || '').trim() ? '전용 키 사용 중 ✓' : '전용 키 미입력 ✗')
+        : (embedMeta.secretKey === null ? '키 불필요' : (hasEmbeddingKey(embedMeta) ? 'ST 저장 키 사용 중 ✓' : '키 미등록 ✗'));
     $summary.append(row('임베딩', `${embedMeta.label} · ${embedModel} · ${embedKey}${settings.embeddingDirty ? ' · ⚠ 재색인 필요' : ''}`));
     $summary.append(row('변환 프로필', getConvertProfileLabel()));
     const keepRecent = Number.isFinite(Number(settings.keepRecent)) ? Math.max(0, Number(settings.keepRecent)) : defaultSettings.keepRecent;
@@ -2935,14 +2967,38 @@ function buildKeyGuide(meta) {
 function updateEmbeddingSourceUi() {
     const settings = getSettings();
     const meta = EMBEDDING_SOURCES[settings.embeddingSource] ?? EMBEDDING_SOURCES.palm;
+    const isPalm = settings.embeddingSource === 'palm';
+    const dedicated = isPalm && settings.embeddingKeyMode === 'dedicated';
     const $status = $('#jev_lorebook_key_status');
     const $help = $('#jev_lorebook_key_help');
+
+    // 전용 키 모드 UI는 palm에서만 노출 — 다른 소스는 reverse_proxy 배선을 안 탄다
+    $('#jev_lorebook_embed_key_mode_row').toggle(isPalm);
+    if (isPalm) {
+        $('#jev_lorebook_embed_key_mode_shared').prop('checked', settings.embeddingKeyMode !== 'dedicated');
+        $('#jev_lorebook_embed_key_mode_dedicated').prop('checked', settings.embeddingKeyMode === 'dedicated');
+    }
+    $('#jev_lorebook_embed_dedicated_key_row').toggle(dedicated);
+    if (dedicated) {
+        $('#jev_lorebook_embed_dedicated_key').val(settings.embeddingDedicatedKey || '');
+    }
+    // 이전에 전용 키를 고른 상태로 소스를 바꿔서 설정은 'dedicated'로 남아있는데 palm이 아니면 안내를 보여준다
+    $('#jev_lorebook_embed_key_mode_unsupported').toggle(!isPalm && settings.embeddingKeyMode === 'dedicated');
+
     // 키 입력칸을 우리가 안 가지고 있다는 걸 명시해야 한다 — 설정탭에 칸이 없으니 최초 설치자는 어디에 넣는지 몰라 막힌다.
-    if (meta.secretKey === null) {
+    if (dedicated) {
+        // 전용 키 모드에서는 ST 금고가 아니라 이 확장 설정을 본다 (hasEmbeddingKey는 금고 전용이라 여기선 안 쓴다)
+        if (String(settings.embeddingDedicatedKey || '').trim()) {
+            $status.text('전용 키 사용 중 ✓').removeClass('jev-key-missing');
+        } else {
+            $status.text('전용 키 미입력 ✗').addClass('jev-key-missing');
+        }
+        $help.hide().empty();
+    } else if (meta.secretKey === null) {
         $status.text('로컬 소스라 API 키가 필요 없어요.').removeClass('jev-key-missing');
         $help.hide().empty(); // 키가 필요 없는 소스엔 안내 자체가 소음이다
     } else if (hasEmbeddingKey(meta)) {
-        $status.text('키 등록됨 ✓').removeClass('jev-key-missing');
+        $status.text(isPalm ? 'ST 저장 키 사용 중 ✓' : '키 등록됨 ✓').removeClass('jev-key-missing');
         $help.hide().empty(); // 끝난 사람한테 잔소리하지 않는다
     } else {
         $status.text('키 미등록 ✗').addClass('jev-key-missing');
@@ -3181,6 +3237,19 @@ jQuery(async () => {
         settings.embeddingDirty = true;
         saveSettingsDebounced();
         $('#jev_lorebook_reindex_warning').show();
+    });
+    // 임베딩 전용 키 모드 (palm 전용, v0.14.0)
+    $('input[name="jev_lorebook_embed_key_mode"]').on('change', function () {
+        settings.embeddingKeyMode = String($(this).val());
+        settings.embeddingDirty = true;
+        saveSettingsDebounced();
+        updateEmbeddingSourceUi();
+    });
+    $('#jev_lorebook_embed_dedicated_key').val(settings.embeddingDedicatedKey).on('input', function () {
+        settings.embeddingDedicatedKey = String($(this).val()).trim();
+        settings.embeddingDirty = true;
+        saveSettingsDebounced();
+        updateEmbeddingSourceUi();
     });
 
     // 변환 프로필 (v0.5) — 열 때마다 최신 목록으로 갱신

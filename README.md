@@ -361,8 +361,16 @@ Jev는 그 전제를 깹니다. 그래서 "매 턴, 후보 30개를 전부 읽�
 
 **방법 A — 동봉된 `jev-proxy` 서버 플러그인**
 
-`config.yaml`에서 `enableServerPlugins: true` 로 바꾸고 서버 재시작.
-(자작 플러그인만 쓸 거면 `enableServerPluginsAutoUpdate: false` 권장)
+⚠️ **URL로 확장만 설치하면 서버 플러그인은 자동으로 안 깔립니다** — 확장 설치와 서버 플러그인 설치는 별개 단계입니다. 아래 복사 단계를 반드시 따로 해 주세요.
+
+1. 이 저장소의 `server-plugin/` 폴더를 아래 위치에 `jev-proxy` 라는 이름으로 복사합니다.
+
+   ```
+   SillyTavern/plugins/jev-proxy/index.js
+   ```
+
+2. `config.yaml`에서 `enableServerPlugins: true` 로 바꾸고 서버 재시작.
+   (자작 플러그인만 쓸 거면 `enableServerPluginsAutoUpdate: false` 권장)
 
 **방법 B — SillyTavern 내장 CORS 프록시**
 
