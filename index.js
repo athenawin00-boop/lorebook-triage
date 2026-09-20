@@ -319,21 +319,21 @@ function getTargetWorlds() {
 
 /**
  * 변환(챗 → 로어북) 저장처 1개. getTargetWorlds()와 **독립 구현**이다.
- * 우선순위: 설정 고정 > 캐릭터 카드 북 > 채팅 바인딩 북.
+ * 우선순위: 설정 고정 > 채팅 바인딩 북 > 캐릭터 카드 북.
+ * v0.7.0까지의 동작 순서를 그대로 유지한다 — 기존 채팅의 저장처가 바뀌면 안 된다.
+ * 발주자는 실사용에서 채팅 바인딩 북을 주로 쓴다(캐릭터 183장 중 카드에 북이 박힌 건 44장).
  * ⚠ 전역·페르소나는 어떤 경우에도 반환하지 않는다 — 전역 북에 사건이 쌓이면 모든 채팅으로 샌다.
- * 카드 북이 없으면 채팅 북으로 폴백한다: 발주자 캐릭터 183장 중 카드에 북이 박힌 건 44장뿐이라
- * 폴백이 없으면 대부분의 채팅에서 변환이 죽는다.
  */
 function getConversionTargetWorld() {
     const settings = getSettings();
     const known = new Set(world_names ?? []);
     if (settings.world) return known.has(settings.world) ? settings.world : '';
     const ctx = SillyTavern.getContext();
+    const chatWorld = ctx.chatMetadata?.[METADATA_KEY];
+    if (chatWorld && typeof chatWorld === 'string' && known.has(chatWorld)) return chatWorld;
     for (const name of getCharacterCardWorlds(ctx)) {
         if (known.has(name)) return name;
     }
-    const chatWorld = ctx.chatMetadata?.[METADATA_KEY];
-    if (chatWorld && typeof chatWorld === 'string' && known.has(chatWorld)) return chatWorld;
     return '';
 }
 
