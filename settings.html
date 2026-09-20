@@ -5,6 +5,9 @@
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
+
+            <div class="jev-set-group">기본</div>
+
             <label class="checkbox_label" for="jev_lorebook_enabled">
                 <input id="jev_lorebook_enabled" type="checkbox" />
                 <span>켜기</span>
@@ -13,35 +16,48 @@
             <label for="jev_lorebook_api_key">Jev API 키 (TypeSafe)</label>
             <input id="jev_lorebook_api_key" class="text_pole" type="password" autocomplete="off" placeholder="Jev API 키가 필요해요. 키가 없으면 동작하지 않아요" />
 
-            <label for="jev_lorebook_budget">턴당 주입 예산 (토큰)</label>
+            <div class="jev-set-group">주입</div>
+
+            <label for="jev_lorebook_budget">턴당 주입 예산</label>
             <input id="jev_lorebook_budget" class="text_pole" type="number" min="500" max="20000" step="100" />
+            <small class="jev-set-help">매 턴 기억에 쓸 최대 토큰. (기본 4,000)</small>
 
-            <label for="jev_lorebook_keep_recent">변환 시 최근 메시지 보존 <small>(변환·숨김 제외, 기본 20)</small></label>
-            <input id="jev_lorebook_keep_recent" class="text_pole" type="number" min="0" max="200" step="1" />
+            <div class="jev-set-group">검색</div>
 
-            <label for="jev_lorebook_embed_source">임베딩 소스 <small>(검색용 벡터 생성)</small></label>
+            <label for="jev_lorebook_embed_source">임베딩 소스</label>
             <select id="jev_lorebook_embed_source" class="text_pole"></select>
             <small id="jev_lorebook_key_status" class="jev-lorebook-status"></small>
             <small class="jev-lorebook-status">Gemini(Google AI Studio)를 추천해요 — 무료 등급으로 충분해요.</small>
 
             <label for="jev_lorebook_embed_model">임베딩 모델</label>
             <input id="jev_lorebook_embed_model" class="text_pole" type="text" autocomplete="off" />
+            <small class="jev-set-help">비우면 기본 모델. 바꾸면 [색인] 다시.</small>
             <small id="jev_lorebook_reindex_warning" class="jev-reindex-warning" style="display: none;">⚠ 임베딩 설정이 바뀌어 재색인이 필요해요 — [색인]을 눌러 주세요.</small>
 
+            <div class="jev-set-group">챗 → 로어북 변환</div>
+
             <div id="jev_lorebook_profile_row" class="jev-profile-row">
-                <label for="jev_lorebook_convert_profile">변환에 사용할 연결 프로필 <small>(챗 → 로어북 변환 전용)</small></label>
+                <label for="jev_lorebook_convert_profile">연결 프로필</label>
                 <select id="jev_lorebook_convert_profile" class="text_pole"></select>
             </div>
 
-            <label for="jev_lorebook_world">대상 로어북 <small>(기본: 이 채팅/캐릭터에 연결된 로어북 자동 감지)</small></label>
+            <label for="jev_lorebook_keep_recent">최근 메시지 보존</label>
+            <input id="jev_lorebook_keep_recent" class="text_pole" type="number" min="0" max="200" step="1" />
+            <small class="jev-set-help">최근 이만큼은 요약·숨김 안 해요. (기본 20)</small>
+
+            <div class="jev-set-group">대상 로어북</div>
+
+            <label for="jev_lorebook_world">대상 로어북</label>
             <select id="jev_lorebook_world" class="text_pole">
                 <option value="">— 선택해 주세요 —</option>
             </select>
+            <small class="jev-set-help">고정하면 다른 채팅에도 같은 기억이 들어가요.</small>
 
             <div id="jev_lorebook_index" class="menu_button menu_button_icon" title="대상 로어북(자동 감지 또는 고정)의 활성 항목을 벡터로 색인해요 (Gemini 임베딩)">
                 <i class="fa-solid fa-database"></i>
                 <span>색인</span>
             </div>
+            <small class="jev-set-help">첫 설치 시 로어북을 연결한 뒤 눌러 주세요.</small>
 
             <small id="jev_lorebook_status" class="jev-lorebook-status"></small>
         </div>

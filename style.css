@@ -13,6 +13,29 @@
     min-height: 1em;
 }
 
+/* ── 설정탭 그룹 (v0.6.4) ─────────────────────────── */
+/* 평면 나열을 기능별로 묶는다. 접지 않는다 — 첫 5분에 숨기면 설치가 어려워진다. */
+
+.jev-lorebook-settings .jev-set-group {
+    font-weight: bold;
+    opacity: 0.9;
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+}
+
+.jev-lorebook-settings .jev-set-group:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+}
+
+.jev-lorebook-settings .jev-set-help {
+    opacity: 0.65;
+    font-size: 0.9em;
+    margin-top: -2px;
+}
+
 /* ── 세부 패널 (요술봉) ─────────────────────────────────────────────── */
 
 .jev-lorebook-panel {
@@ -157,6 +180,119 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+}
+
+/* ── 변환 프로필 배지 (v0.6.4) ─────────────────────── */
+/* "메인 API를 사용해요" 고정문구 자리. 버튼 누르기 직전에 어떤 모델로 요약하는지 보여준다. */
+
+.jev-profile-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    align-self: flex-start;
+    padding: 3px 9px;
+    border-radius: 11px;
+    font-size: 0.88em;
+    background-color: rgba(128, 128, 128, 0.14);
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+}
+
+.jev-profile-badge i {
+    opacity: 0.75;
+}
+
+.jev-profile-badge.jev-badge-warn {
+    color: var(--warning, #e5a50a);
+    border-color: var(--warning, #e5a50a);
+    background-color: rgba(229, 165, 10, 0.12);
+}
+
+.jev-profile-badge.jev-badge-warn i {
+    opacity: 1;
+}
+
+/* ── 항목 전문 펼치기 (v0.6.4) ────────────────────── */
+/* PC·폰 동일하게 클릭 하나. hover는 폰에 없어서 안 쓴다. */
+
+.jev-panel-table td.jev-cell-toggle {
+    text-align: center;
+    padding: 2px 4px;
+}
+
+.jev-detail-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    padding: 2px 7px;
+    border-radius: 9px;
+    white-space: nowrap;
+    opacity: 0.75;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+}
+
+.jev-detail-toggle:hover,
+.jev-detail-toggle:focus-visible,
+.jev-detail-toggle.jev-open {
+    opacity: 1;
+    background-color: rgba(128, 128, 128, 0.16);
+}
+
+.jev-detail-toggle i {
+    font-size: 0.85em;
+}
+
+.jev-panel-table tr.jev-detail-row > td {
+    white-space: normal;
+    background-color: rgba(128, 128, 128, 0.07);
+}
+
+/* 높이 제한 없음 — 항목이 청크로 쪼져 있어서 길어야 얼마 안 된다(현이 결정). */
+.jev-detail-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+    padding: 6px 4px;
+}
+
+/* ── 코어 ↔ 검색층 전환 (v0.6.4) ──────────────────── */
+/* 파란 원 = 상시(코어, 매 턴 고정주입) / 초록 원 = 검색층(Jev가 골라서 넣음) */
+
+.jev-panel-table td.jev-cell-core {
+    text-align: center;
+    padding: 2px 4px;
+    width: 1%;
+}
+
+.jev-core-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 3px 5px;
+    border-radius: 50%;
+    line-height: 1;
+    transition: transform 0.12s ease, background-color 0.12s ease;
+}
+
+.jev-core-toggle:hover,
+.jev-core-toggle:focus-visible {
+    background-color: rgba(128, 128, 128, 0.2);
+    transform: scale(1.15);
+}
+
+.jev-core-toggle.disabled {
+    opacity: 0.4;
+    cursor: default;
+    transform: none;
+}
+
+.jev-core-toggle.jev-is-core i {
+    color: #4a90d9;
+}
+
+.jev-core-toggle.jev-is-search i {
+    color: #5fa570;
 }
 
 /* ── 챗 적치 현황 막대 (v0.6.3) ───────────────────────────────── */

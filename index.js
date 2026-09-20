@@ -60,6 +60,7 @@ const SPLIT_EST_CHARS_PER_TOKEN = 3;     // 한글 혼용 보수 추정 (이식 
 const SPLIT_BIG_CONSTANT_CHARS = 3000;   // constant 항목이 이 크기를 넘으면 기본 체크 후보 (≈1,000토큰)
 const CORE_TOKEN_LIMIT = 800;            // 코어 스냅샷 상한 — 프롬프트 강제, 초과 시 경고 로그
 const CORE_ORDER = 1000;                 // 코어 메모리 삽입 순서 — 일반 항목 기본값(100)보다 위
+const NORMAL_ORDER = 100;                // 일반(검색층) 항목 순서 — 코어에서 강등할 때 되돌리는 값
 // 변환 지시문 — 현이가 손으로 쓰던 프롬프트 + 파싱용 구조 강제 + 코어 상태 스냅샷(누적 서술 아님)
 const CONVERT_PROMPT = [
     'You are converting roleplay chat logs into lorebook entries.',
@@ -228,6 +229,98 @@ async function vectorPurge(worldName) {
     if (!response.ok) {
         throw new Error(`벡터 purge 실패 (HTTP ${response.status})`);
     }
+}
+
+/**
+ * 항목을 코어(constant) ↔ 검색층 사이로 옮긴다 (v0.6.4).
+ *
+ * 승격(검색층 → 코어): constant=true + order=1000.
+ *   벼터는 그대로 두어도 된다 — 후보 회수부가 constant 항목을 이미 걸러낸다(이중 주입 없음).
+ *   남은 벡터는 다음 재색인 때 자동으로 청소된다 → 임베딩 호출 0회.
+ * 강등(코어 → 검색층): constant=false + order=100 + 그 항목만 벡터에 삽입 → 임베딩 1회.
+ */
+async function setEntryCore(world, uid, toCore) {
+    const worldData = await loadWorldInfo(world);
+    const entry = worldData?.entries?.[uid];
+    if (!entry) throw new Error(`uid ${uid} 항목을 찾지 못했어요`);
+
+    entry.constant = !!toCore;
+    entry.order = toCore ? CORE_ORDER : NORMAL_ORDER;
+    await saveWorldInfo(world, worldData, true);
+
+    if (!toCore) {
+        const content = String(entry.content ?? '');
+        await vectorInsert(world, [{ hash: getStringHash(content), text: content, index: Number(uid) }]);
+    }
+    console.log(`${LOG} '${world}' uid ${uid} → ${toCore ? '코어(constant, order 1000)' : '검색층(order 100, 벡터 삽입)'}`);
+}
+
+/** 대략 토큰수 (chars/4) — 패널 표시용 근사치 */
+function approxTokens(text) {
+    return Math.max(1, Math.round(String(text ?? '').length / 4));
+}
+
+/**
+ * 전문 펼침 셀 + 상세 행 (v0.6.4).
+ * PC·폰 동일하게 클릭 하나. hover는 폰에 없어서 쓰지 않는다.
+ * 여러 행을 동시에 펼칠 수 있고(항목끼리 비교용), 높이 제한은 두지 않는다(현이 결정).
+ */
+function buildDetailToggle(content, colSpan) {
+    const $toggle = $('<span class="jev-detail-toggle" role="button" tabindex="0">')
+        .attr('title', '이 항목의 본문 전문을 펼쳐서 봐요')
+        .append($('<i class="fa-solid fa-chevron-down">'))
+        .append($('<span>').text('전문'));
+
+    const $detail = $('<tr class="jev-detail-row" style="display: none;">')
+        .append($('<td>').attr('colspan', colSpan).append($('<div class="jev-detail-body">').text(String(content ?? ''))));
+
+    const toggleDetail = () => {
+        const opening = $detail.css('display') === 'none';
+        $detail.toggle(opening);
+        $toggle.toggleClass('jev-open', opening)
+            .find('i').toggleClass('fa-chevron-down', !opening).toggleClass('fa-chevron-up', opening);
+    };
+    $toggle.on('click', toggleDetail);
+    $toggle.on('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggleDetail(); }
+    });
+
+    return { $cell: $('<td class="jev-cell-toggle">').append($toggle), $detail };
+}
+
+/**
+ * 코어 ↔ 검색층 전환 셀 (v0.6.4) — 파란 원 = 상시(코어), 초록 원 = 검색층.
+ * 확인 팝업 없음(현이 결정) — 다시 누르면 되돌아가고 합계 토큰이 즉시 보이므로 피드백이 충분하다.
+ */
+function buildCoreToggle(world, uid, isCore, $panel) {
+    const $btn = $('<span class="jev-core-toggle" role="button" tabindex="0">')
+        .addClass(isCore ? 'jev-is-core' : 'jev-is-search')
+        .attr('title', isCore
+            ? '상시 메모리(코어) — 누르면 검색층으로 내려요'
+            : '검색층 메모리 — 누르면 상시(코어)로 올려요')
+        .append($('<i class="fa-solid fa-circle">'));
+
+    const run = async () => {
+        if ($btn.hasClass('disabled')) return;
+        $btn.addClass('disabled');
+        try {
+            await setEntryCore(world, uid, !isCore);
+            toastr.success(
+                !isCore ? '상시 메모리로 올렸어요 (order 1000)' : '검색층으로 내렸어요 (벡터 삽입 완료)',
+                'Jev Lorebook');
+            await renderPanelChunks($panel);
+            renderPanelSummary($panel);
+        } catch (error) {
+            toastr.error(String(error?.message ?? error), 'Jev Lorebook');
+            $btn.removeClass('disabled');
+        }
+    };
+    $btn.on('click', run);
+    $btn.on('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); run(); }
+    });
+
+    return $('<td class="jev-cell-core">').append($btn);
 }
 
 /** 색인된 hash 목록 — 관측 뷰어의 색인 여부 대조용 (src/endpoints/vectors.js:530 POST /list → number[]) */
@@ -545,6 +638,9 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
                 world: String(r.world),
                 uid: r.uid,
                 title: r.title,
+                // 판정 시점의 본문을 그대로 보관한다(v0.6.4) — 나중에 항목이 수정돼도
+                // "그때 Jev가 무엇을 보고 판단했는지"가 흐려지면 안 된다.
+                text: String(r.text ?? ''),
                 contradiction: r.contradiction,
                 sceneFit: r.sceneFit,
                 duplicate: r.duplicate,
@@ -813,6 +909,35 @@ function openWorldEditor(world) {
     if ($('#WorldInfo').hasClass('closedDrawer')) {
         $('#WIDrawerIcon').trigger('click');
     }
+}
+
+/**
+ * 변환 프로필 배지 — 아이콘 + 표시명 + 경고 여부.
+ * v0.5에서 드롭다운을 붙였는데 panel.html은 "메인 API를 사용해요"로 고정돼 있었다(v0.6.4 수정).
+ * 주의: getProfile()은 못 찾으면 예외가 아니라 undefined를 돌려준다 — catch가 아니라 falsy로 가른다.
+ */
+function getConvertProfileBadge() {
+    const settings = getSettings();
+    if (!settings.convertProfileId) {
+        return { icon: 'fa-plug', text: '현재 연결 그대로', warn: false };
+    }
+    try {
+        const profile = ConnectionManagerRequestService.getProfile(settings.convertProfileId);
+        const name = profile?.name || profile?.id;
+        if (name) return { icon: 'fa-plug-circle-check', text: String(name), warn: false };
+    } catch {
+        // connection-manager 비활성 — 아래 경고로 떨어진다
+    }
+    return { icon: 'fa-plug-circle-xmark', text: `${settings.convertProfileId} (프로필을 찾지 못했어요)`, warn: true };
+}
+
+/** 변환 프로필 배지를 패널에 그린다 (변환 버튼 바로 위) */
+function renderConvertProfileBadge($panel) {
+    const badge = getConvertProfileBadge();
+    $panel.find('#jev_panel_convert_profile').empty()
+        .toggleClass('jev-badge-warn', badge.warn)
+        .append($(`<i class="fa-solid ${badge.icon}">`))
+        .append($('<span>').text(badge.text));
 }
 
 /** 변환 프로필 표시명 — 패널·상태줄용 */
@@ -1198,6 +1323,7 @@ function renderPanelSummary($panel) {
     const keepRecent = Number.isFinite(Number(settings.keepRecent)) ? Math.max(0, Number(settings.keepRecent)) : defaultSettings.keepRecent;
     $summary.append(row('변환 대상', convertWorld || '없음'));
     $summary.append(renderChatStack(ctx.chat ?? [], converted, keepRecent, chatLength));
+    renderConvertProfileBadge($panel);
 }
 
 /**
@@ -1294,7 +1420,7 @@ function renderPanelJudgment($panel) {
 
     const $table = $('<table class="jev-panel-table">');
     const $thead = $('<tr>');
-    for (const h of ['채택', '월드', 'uid', '제목', '모순위험', '장면적합', '최근중복', '최종', '토큰']) {
+    for (const h of ['채택', '월드', 'uid', '제목', '모순위험', '장면적합', '최근중복', '최종', '토큰', '']) {
         $thead.append($('<th>').text(h));
     }
     $table.append($('<thead>').append($thead));
@@ -1310,7 +1436,11 @@ function renderPanelJudgment($panel) {
         $tr.append($('<td>').text(r.duplicate.toFixed(2)));
         $tr.append($('<td>').text(r.final.toFixed(3)));
         $tr.append($('<td>').text(r.tokens ?? '—'));
-        $tbody.append($tr);
+
+        // 전문 펼치기(v0.6.4) — 점수만 보고는 왜 뻐졌는지 몰라서 여기가 제일 많이 쓰인다.
+        const { $cell, $detail } = buildDetailToggle(r.text, 10);
+        $tr.append($cell);
+        $tbody.append($tr).append($detail);
     }
     $table.append($tbody);
     $box.append($table);
@@ -1351,7 +1481,9 @@ async function renderPanelChunks($panel) {
         let indexedCount = 0;
         const $table = $('<table class="jev-panel-table">');
         const $thead = $('<tr>');
-        for (const h of ['색인', 'uid', '제목', '날짜키', '≈토큰']) {
+        // '날짜키' 칸 제거(v0.6.4) — keys[0]을 찍던 자리였고, v0.6.0에서 날짜 키 생성을 없앤 뒤로는
+        // 사용자가 직접 넣은 키워드가 올라와 칸 이름이 거짓말을 하고 있었다. 본문은 [전문] 버튼으로 본다.
+        for (const h of ['색인', 'uid', '제목', '≈토큰', '', '']) {
             $thead.append($('<th>').text(h));
         }
         $table.append($('<thead>').append($thead));
@@ -1361,14 +1493,16 @@ async function renderPanelChunks($panel) {
             const hash = getStringHash(content);
             const isIndexed = indexedHashes ? indexedHashes.has(Number(hash)) : false;
             if (isIndexed) indexedCount++;
-            const keys = Array.isArray(e.key) ? e.key : [];
             const $tr = $('<tr>').toggleClass('jev-missing', indexedHashes ? !isIndexed : false);
             $tr.append($('<td>').text(indexedHashes ? (isIndexed ? '✓' : '✗') : '?'));
             $tr.append($('<td>').text(e.uid));
             $tr.append($('<td class="jev-cell-title">').text(String(e.comment || `uid ${e.uid}`).slice(0, 48)));
-            $tr.append($('<td>').text(String(keys[0] ?? '')));
-            $tr.append($('<td>').text(Math.max(1, Math.round(content.length / 4)))); // 대략치 (chars/4)
-            $tbody.append($tr);
+            $tr.append($('<td>').text(approxTokens(content)));
+            $tr.append(buildCoreToggle(world, e.uid, false, $panel));
+
+            const { $cell, $detail } = buildDetailToggle(content, 6);
+            $tr.append($cell);
+            $tbody.append($tr).append($detail);
         }
         $table.append($tbody);
 
@@ -1378,17 +1512,41 @@ async function renderPanelChunks($panel) {
               + (indexedHashes ? ` (벡터 저장소 ${indexedHashes.size}건)` : '')
               + (disabledCount ? ` · 비활성/빈 항목 ${disabledCount}개 제외` : '');
         $section.append($('<div class="jev-panel-world-title">').text(headline));
+        $section.append($('<div class="jev-panel-muted">').text(
+            '🔵 = 상시 메모리(매 턴 주입) · 🟢 = 검색층 / 누르면 전환할 수 있습니다.'));
 
-        // 코어 메모리 섹션 — constant라 ST가 매턴 네이티브 주입, Jev 판정·벡터 색인 제외
+        // 코어 메모리 섹션 — constant라 ST가 매턴 네이티브 주입, Jev 판정·벡터 색인 제외.
+        // v0.6.4: 아래 색인 현황과 같은 표 형식 + 합계 토큰. 코어는 매 턴 고정비용이라
+        // 파란불을 늘릴수록 이 숫자가 올라간다 — 개수만 보여주면 늘린 대가가 안 보인다.
         if (coreEntries.length) {
+            const coreTokens = coreEntries.reduce((sum, e) => sum + approxTokens(e.content), 0);
+            const budget = Number(getSettings().budgetTokens) || defaultSettings.budgetTokens;
             const $core = $('<div class="jev-panel-core">');
-            $core.append($('<div class="jev-panel-core-title">').text(`⭐ 코어 메모리 ${coreEntries.length}개 — 매 턴 항상 주입돼요 (constant, Jev 판정을 거치지 않아요)`));
+            $core.append($('<div class="jev-panel-core-title">').text(
+                `⭐ 코어 메모리 ${coreEntries.length}개 · 합계 ≈${coreTokens.toLocaleString()}토큰 · 주입 예산 ${budget.toLocaleString()} → 매 턴 ≈${(coreTokens + budget).toLocaleString()}토큰`));
+            $core.append($('<div class="jev-panel-muted">').text('매 턴 항상 주입돼요 (constant, Jev 판정을 거치지 않아요)'));
+
+            const $coreTable = $('<table class="jev-panel-table">');
+            const $coreHead = $('<tr>');
+            for (const h of ['uid', '제목', '≈토큰', '', '']) {
+                $coreHead.append($('<th>').text(h));
+            }
+            $coreTable.append($('<thead>').append($coreHead));
+            const $coreBody = $('<tbody>');
             for (const e of coreEntries) {
                 const content = String(e.content ?? '');
-                $core.append($('<div class="jev-panel-row">')
-                    .append($('<span class="jev-panel-label">').text(String(e.comment || `uid ${e.uid}`).slice(0, 32)))
-                    .append($('<span>').text(`≈${Math.max(1, Math.round(content.length / 4))}토큰 · uid ${e.uid}`)));
+                const $tr = $('<tr>');
+                $tr.append($('<td>').text(e.uid));
+                $tr.append($('<td class="jev-cell-title">').text(String(e.comment || `uid ${e.uid}`).slice(0, 48)));
+                $tr.append($('<td>').text(approxTokens(content)));
+                $tr.append(buildCoreToggle(world, e.uid, true, $panel));
+
+                const { $cell, $detail } = buildDetailToggle(content, 5);
+                $tr.append($cell);
+                $coreBody.append($tr).append($detail);
             }
+            $coreTable.append($coreBody);
+            $core.append($coreTable);
             $section.append($core);
         }
 
