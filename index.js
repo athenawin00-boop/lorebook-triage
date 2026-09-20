@@ -1247,6 +1247,28 @@ function isCoreFamilyComment(comment) {
         || c === LEGACY_CORE_COMMENT
         || c.startsWith(`${LEGACY_CORE_COMMENT}${LEGACY_CORE_ARCHIVED_SUFFIX}`);
 }
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function isValidIsoDate(d) { return ISO_DATE_RE.test(String(d ?? '')); }
+
+/**
+ * 일기 날짜 범위 산출 (v0.13.1 버그 수정) — 사건 배열의 나열 순서가 항상 시간순은 아니라서
+ * '첫 사건=시작 / 마지막 사건=종료'로 집으면 역전될 수 있었다(실측: 시작 2026-09-14 > 종료 2026-05-12).
+ * 기존 일기 범위(있으면)와 이번 사건들의 날짜를 전부 모아 min~max로 계산한다 — 범위가 줄어들 일은 없다.
+ * 파싱 실패(YYYY-MM-DD 형식이 아닌) 날짜는 후보에서 제외하고, 후보가 하나도 없으면 앵커로 대체한다.
+ */
+function computeDiaryRange(existingRange, incidentDates, anchor) {
+    const candidates = [
+        ...(existingRange ? [existingRange.start, existingRange.end] : []),
+        ...incidentDates,
+    ].filter(isValidIsoDate);
+    if (!candidates.length) {
+        const fallback = isValidIsoDate(anchor) ? anchor : '';
+        return { start: fallback, end: fallback };
+    }
+    candidates.sort(); // YYYY-MM-DD 문자열 정렬 = 시간순
+    return { start: candidates[0], end: candidates[candidates.length - 1] };
+}
+
 /** 코어 일기 order 재계산 — 규칙 바로 아래, 오래된 것일수록 규칙에 가깝게(값이 크게) 배치한다. 매 변환마다 전체 재배치 */
 function recomputeDiaryOrders(worldData) {
     findCoreDiaryEntries(worldData).forEach((entry, idx) => {
@@ -1770,8 +1792,9 @@ async function convertChatToLorebook(setStatus) {
 
         let diaryUpdatedNote = '미갱신';
         if (diaryResult.ok) {
-            const diaryStart = openDiaryBefore ? (parseDiaryComment(openDiaryBefore.comment)?.start ?? anchor) : anchor;
-            const diaryEnd = lastDate || diaryStart;
+            // v0.13.1 — min~max로 계산(위 computeDiaryRange 주석의 실측 버그 참조). lastDate 단독 사용 금지.
+            const existingRange = openDiaryBefore ? parseDiaryComment(openDiaryBefore.comment) : null;
+            const { start: diaryStart, end: diaryEnd } = computeDiaryRange(existingRange, incidents.map(inc => inc.date), anchor);
             const diaryContent = buildDiaryContent(diaryStart, diaryEnd, diaryResult.body);
             const diaryTokens = await getTokenCountAsync(diaryContent);
             const sealNow = diaryTokens > CORE_DIARY_TOKEN_LIMIT;
