@@ -2474,6 +2474,12 @@ jQuery(async () => {
     // 임베딩 소스/모델 (v0.5) — 변경 시 기존 색인과 벡터 차원이 어긋나므로 재색인 경고
     populateEmbeddingSourceSelect();
     updateEmbeddingSourceUi();
+    // v0.9.2 — ST가 키를 저장·삭제·교체하면 즉시 다시 그린다.
+    // 이게 없으면 API 연결에서 키를 제대로 등록해도 새로고침 전까지 '키 미등록 ✗'이 그대로 박혀 있다
+    // — 사용자 제보로 확인된 오진 경로. writeSecret()이 SECRET_WRITTEN을 쏜다(secrets.js:375).
+    for (const evt of [event_types.SECRET_WRITTEN, event_types.SECRET_DELETED, event_types.SECRET_ROTATED]) {
+        if (evt) eventSource.on(evt, () => updateEmbeddingSourceUi());
+    }
     $('#jev_lorebook_embed_source').on('change', function () {
         settings.embeddingSource = String($(this).val());
         settings.embeddingModel = ''; // 소스가 바뀌면 모델은 새 소스 기본값으로
