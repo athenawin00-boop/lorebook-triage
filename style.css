@@ -158,3 +158,72 @@
     flex-direction: column;
     gap: 6px;
 }
+
+/* ── 챗 적치 현황 막대 (v0.6.3) ───────────────────────────────── */
+.jev-stack-box {
+    margin: 6px 0 2px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background-color: rgba(128, 128, 128, 0.08);
+}
+
+.jev-stack-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 5px;
+}
+
+.jev-stack-bar {
+    display: flex;
+    height: 14px;
+    border-radius: 7px;
+    overflow: hidden;
+    background-color: rgba(128, 128, 128, 0.15);
+}
+
+.jev-stack-seg {
+    height: 100%;
+    transition: width 0.25s ease;
+}
+
+.jev-seg-done    { background-color: rgba(128, 128, 128, 0.45); }
+.jev-seg-pending { background-color: rgba(230, 170, 60, 0.85); }
+.jev-seg-buffer  { background-color: rgba(90, 160, 110, 0.75); }
+
+.jev-stack-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin-top: 6px;
+    font-size: 0.88em;
+}
+
+.jev-leg {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.jev-leg b { font-weight: 600; }
+.jev-leg > span { opacity: 0.85; }
+
+.jev-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+}
+
+.jev-stack-verdict {
+    margin-top: 7px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(128, 128, 128, 0.2);
+    font-size: 0.9em;
+    line-height: 1.45;
+    opacity: 0.9;
+}
+
+.jev-verdict-warm { color: var(--warning, #e5a50a); opacity: 1; }
+.jev-verdict-hot  { color: var(--warning, #e5a50a); opacity: 1; font-weight: 600; }

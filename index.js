@@ -1197,37 +1197,81 @@ function renderPanelSummary($panel) {
     $summary.append(row('변환 프로필', getConvertProfileLabel()));
     const keepRecent = Number.isFinite(Number(settings.keepRecent)) ? Math.max(0, Number(settings.keepRecent)) : defaultSettings.keepRecent;
     $summary.append(row('변환 대상', convertWorld || '없음'));
-    $summary.append(row('변환 지점', `${converted}/${chatLength} 메시지 (최근 ${keepRecent}개 보존)`));
-
-    // 미변환 적치량 — 토큰 집계는 비동기라 먼저 건수만 그리고 뒤에서 채운다
-    const pendingEnd = Math.max(converted, chatLength - keepRecent);
-    const pendingCount = Math.max(0, pendingEnd - converted);
-    const $pending = $('<span>').text(pendingCount ? `${pendingCount}건 · 토큰 세는 중…` : '없음 (새 메시지가 보존 버퍼 안에만 있어요)');
-    $summary.append($('<div class="jev-panel-row">')
-        .append($('<span class="jev-panel-label">').text('변환 대기'))
-        .append($pending));
-    if (pendingCount) {
-        void fillPendingTokens($pending, ctx.chat ?? [], converted, pendingEnd, keepRecent, chatLength);
-    }
+    $summary.append(renderChatStack(ctx.chat ?? [], converted, keepRecent, chatLength));
 }
 
 /**
- * 변환 대기 구간의 토큰을 세서 채운다. 패널 렌더를 막지 않게 비동기로 분리.
- * 보존 버퍼(최근 N개)는 변환 대상이 아니라 따로 병기한다.
+ * 챗 적치 현황 — 세 구간을 가로 막대로 보여준다.
+ *   정리됨(이미 로어북으로 감) / 대기(지금 누르면 처리됨) / 보존(최근 N개, 손 안 댈)
+ * 숫자만 나열하면 "지금 변환해야 하나"를 한눈에 못 읽는다 — 비율로 보여야 읽힌다.
  */
-async function fillPendingTokens($slot, chat, from, to, keepRecent, chatLength) {
+function renderChatStack(chat, converted, keepRecent, chatLength) {
+    const pendingEnd = Math.max(converted, chatLength - keepRecent);
+    const pendingCount = Math.max(0, pendingEnd - converted);
+    const bufferCount = Math.max(0, chatLength - pendingEnd);
+    const pct = (n) => (chatLength > 0 ? `${(n / chatLength) * 100}%` : '0%');
+
+    const $box = $('<div class="jev-stack-box">');
+    $box.append($('<div class="jev-stack-head">')
+        .append($('<span class="jev-panel-label">').text('챗 적치'))
+        .append($('<span class="jev-panel-muted">').text(`전체 ${chatLength}개`)));
+
+    const $bar = $('<div class="jev-stack-bar">');
+    const seg = (cls, n, title) => $('<div>').addClass(`jev-stack-seg ${cls}`).css('width', pct(n)).attr('title', title);
+    $bar.append(seg('jev-seg-done', converted, `정리됨 ${converted}개`));
+    $bar.append(seg('jev-seg-pending', pendingCount, `변환 대기 ${pendingCount}개`));
+    $bar.append(seg('jev-seg-buffer', bufferCount, `보존 ${bufferCount}개`));
+    $box.append($bar);
+
+    const $legend = $('<div class="jev-stack-legend">');
+    const leg = (cls, icon, label, text) => $('<span class="jev-leg">')
+        .append($('<i>').addClass(`jev-dot ${cls}`))
+        .append($('<b>').text(`${icon} ${label}`))
+        .append($('<span>').text(` ${text}`));
+    const $legPending = leg('jev-seg-pending', '⏳', '대기', `${pendingCount}건`);
+    const $legBuffer = leg('jev-seg-buffer', '🔒', '보존', `${bufferCount}건`);
+    $legend.append(leg('jev-seg-done', '✅', '정리됨', `${converted}건`));
+    $legend.append($legPending);
+    $legend.append($legBuffer);
+    $box.append($legend);
+
+    const $verdict = $('<div class="jev-stack-verdict">')
+        .text(pendingCount ? '⏳ 토큰을 세는 중이에요…' : '✔️ 쌓인 게 없어요 — 새 메시지가 보존 구간 안에만 있어요');
+    $box.append($verdict);
+
+    if (pendingCount) {
+        void fillStackTokens({ $legPending, $legBuffer, $verdict }, chat, converted, pendingEnd, keepRecent, chatLength);
+    }
+    return $box;
+}
+
+/**
+ * 막대 범례·판정문에 토큰을 채운다. 패널 렌더를 막지 않게 비동기로 분리.
+ * 보존 버퍼는 변환 대상이 아니라 합산하지 않고 따로 보여준다.
+ */
+async function fillStackTokens($slots, chat, from, to, keepRecent, chatLength) {
+    const join = (arr) => arr.map(m => String(m?.mes || '')).filter(Boolean).join('\n');
     try {
-        const body = chat.slice(from, to).map(m => String(m?.mes || '')).filter(Boolean).join('\n');
-        const pendingTokens = body ? await getTokenCountAsync(body) : 0;
-        const bufBody = keepRecent
-            ? chat.slice(Math.max(0, chatLength - keepRecent)).map(m => String(m?.mes || '')).filter(Boolean).join('\n')
-            : '';
+        const pendingBody = join(chat.slice(from, to));
+        const pendingTokens = pendingBody ? await getTokenCountAsync(pendingBody) : 0;
+        const bufBody = keepRecent ? join(chat.slice(Math.max(0, chatLength - keepRecent))) : '';
         const bufTokens = bufBody ? await getTokenCountAsync(bufBody) : 0;
         const count = Math.max(0, to - from);
-        $slot.text(`${count}건 · ${pendingTokens.toLocaleString()}토큰`
-            + (keepRecent ? `  (보존 버퍼 ${keepRecent}개 = ${bufTokens.toLocaleString()}토큰, 변환 안 함)` : ''));
+
+        $slots.$legPending.find('span').last().text(` ${count}건 · ${pendingTokens.toLocaleString()}tok`);
+        $slots.$legBuffer.find('span').last().text(` ${Math.max(0, chatLength - to)}건 · ${bufTokens.toLocaleString()}tok`);
+
+        // 판정문 — 숫자를 보고도 "그래서 눌러야 되나"를 못 정하는 걸 막는다
+        let mark = '✔️';
+        let verdict = '아직 여유 있어요';
+        if (pendingTokens >= 20000) { mark = '🔴'; verdict = '꽤 많이 쌓였어요 — 지금 변환하는 걸 추천해요'; }
+        else if (pendingTokens >= 8000) { mark = '🟡'; verdict = '변환할 만해요'; }
+        $slots.$verdict
+            .toggleClass('jev-verdict-hot', pendingTokens >= 20000)
+            .toggleClass('jev-verdict-warm', pendingTokens >= 8000 && pendingTokens < 20000)
+            .text(`${mark} 지금 [챗→로어북 변환]을 누르면 ${count}건 · ${pendingTokens.toLocaleString()}토큰이 로어북으로 넘어가요 — ${verdict}`);
     } catch (error) {
-        $slot.text(`${Math.max(0, to - from)}건 · 토큰 집계 실패: ${error?.message ?? error}`);
+        $slots.$verdict.addClass('jev-panel-error').text(`토큰 집계에 실패했어요: ${error?.message ?? error}`);
     }
 }
 
