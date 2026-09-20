@@ -1,0 +1,12 @@
+{
+    "name": "jev-proxy",
+    "version": "0.14.0",
+    "description": "Jev Lorebook 동봉 서버 플러그인 — TypeSafe Jev(api.typesafe.ai/v1/systemone) 순수 패스스루. 이 저장소를 SillyTavern/plugins/jev-proxy 로 클론하면 ST 플러그인 로더가 main 을 따라 server-plugin/index.js 를 적재한다.",
+    "type": "commonjs",
+    "main": "server-plugin/index.js",
+    "license": "AGPL-3.0",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/athenawin00-boop/lorebook-triage.git"
+    }
+}

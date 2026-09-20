@@ -373,7 +373,7 @@ Jev는 그 전제를 깹니다. 그래서 "매 턴, 후보 30개를 전부 읽�
 
 #### 방법 A — 동봉된 `jev-proxy` 서버 플러그인 (권장 / 로그인 서버는 필수)
 
-파일 복사 + `config.yaml` 한 줄 + 서버 재시작이 필요합니다.
+`git clone` 한 줄 + `config.yaml` 한 줄 + 서버 재시작이면 됩니다.
 설치 절차는 **[4-2 설치](#4-2-설치)에 한 곳으로 모아두었습니다.** 거기만 따라 하시면 됩니다.
 
 #### 방법 B — SillyTavern 내장 CORS 프록시 (로그인 안 켠 서버 전용)
@@ -398,32 +398,30 @@ SillyTavern/public/scripts/extensions/third-party/lorebook-triage/
 
 여기에 저장소 내용을 넣고 브라우저 새로고침.
 
-### 서버 플러그인 설치 — 방법 A를 쓴다면 **이 3단계를 전부** 하셔야 합니다
+### 서버 플러그인 설치 — 방법 A를 쓴다면
 
-> ⚠️ **가장 흔한 실패:** `config.yaml`의 `enableServerPlugins: true` 만 켜고 **파일을 복사하지 않는 것.**
-> 확장 설치(위)와 서버 플러그인 설치(여기)는 **완전히 별개**입니다.
-> SillyTavern의 URL 설치 기능은 **확장만** 내려받습니다. 서버 플러그인은 URL 설치 경로가 아예 없어서, `server-plugin/` 폴더는 확장 폴더 안에 그대로 앉아만 있습니다. **손으로 옮겨야 합니다.**
+> ⚠️ **확장 설치(위)와 서버 플러그인 설치(여기)는 완전히 별개입니다.**
+> SillyTavern의 URL 설치 기능은 **확장만** 내려받습니다. 서버 플러그인은 URL 설치 경로가 아예 없어서, 아래 3단계를 **따로** 해 주셔야 합니다.
+> 가장 흔한 실패가 `enableServerPlugins: true` 만 켜고 이 단계를 건너뛰는 것입니다.
 
-**1단계 — 파일 복사 (먼저 하세요)**
+**1단계 — 플러그인 내려받기**
 
-확장 폴더 안의 `server-plugin/` 을 SillyTavern의 `plugins/` 아래에 **`jev-proxy` 라는 이름으로** 복사합니다.
-
-```
-(복사 전)  SillyTavern/public/scripts/extensions/third-party/lorebook-triage/server-plugin/index.js
-(복사 후)  SillyTavern/plugins/jev-proxy/index.js
-```
-
-명령줄로 한다면, SillyTavern 폴더에서:
+SillyTavern 폴더에서 아래를 그대로 실행하세요. **폴더 이름을 반드시 `jev-proxy` 로** 지정해야 합니다.
 
 ```bash
-cp -R public/scripts/extensions/third-party/lorebook-triage/server-plugin plugins/jev-proxy
+cd SillyTavern/plugins
+git clone https://github.com/athenawin00-boop/lorebook-triage jev-proxy
 ```
+
+이 저장소는 **확장이자 서버 플러그인**입니다. 루트의 `package.json` 이 SillyTavern에게 `server-plugin/index.js` 를 읽으라고 알려주므로, 하위 폴더를 꺼내거나 이름을 바꿀 필요가 없습니다. 통째로 클론하면 끝입니다.
+
+> `git` 이 없다면: 저장소를 ZIP으로 받아 압축을 풀고, **폴더 이름을 `jev-proxy` 로 바꿔서** `SillyTavern/plugins/` 안에 넣으셔도 동일하게 동작합니다. (다만 아래 자동 업데이트는 git으로 받았을 때만 됩니다.)
 
 **2단계 — `config.yaml` 수정**
 
 ```yaml
 enableServerPlugins: true
-enableServerPluginsAutoUpdate: false   # 자작 플러그인만 쓸 거면 권장
+enableServerPluginsAutoUpdate: true   # 켜두면 플러그인이 알아서 최신으로 갱신됩니다
 ```
 
 **3단계 — 서버 재시작**
@@ -432,9 +430,24 @@ enableServerPluginsAutoUpdate: false   # 자작 플러그인만 쓸 거면 권�
 
 **확인 — 제대로 됐는지 보는 법**
 
-- 재시작 직후 서버 콘솔에 `1 server plugin(s) are currently loaded.` 같은 줄이 뜹니다.
+- 재시작 직후 서버 콘솔에 이런 줄이 뜹니다.
+
+  ```
+  Initializing plugin from .../plugins/jev-proxy/server-plugin/index.js
+  [jev-proxy] route registered: POST /api/plugins/jev-proxy/systemone → https://api.typesafe.ai/v1/systemone
+  1 server plugin(s) are currently loaded.
+  ```
+
 - 확장 패널의 통로 표시가 **`서버 플러그인 (jev-proxy)`** 로 바뀝니다.
-- 둘 다 아니면 1단계 경로를 다시 보세요. 최종 파일이 정확히 `SillyTavern/plugins/jev-proxy/index.js` 여야 합니다.
+- 둘 다 아니라면 폴더 이름을 확인하세요. 경로가 정확히 `SillyTavern/plugins/jev-proxy/` 여야 합니다.
+
+**업데이트**
+
+`enableServerPluginsAutoUpdate: true` 이면 서버가 켜질 때마다 알아서 최신으로 당겨옵니다. 직접 하시려면:
+
+```bash
+cd SillyTavern/plugins/jev-proxy && git pull
+```
 
 ## 4-3. 첫 세팅 (한 번만)
 
