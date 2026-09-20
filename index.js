@@ -56,6 +56,9 @@ const CONVERT_META_KEY = 'jevLorebookLastConverted'; // chat_metadata에 저장�
 // 작중 날짜 앵커 (v0.7.0) — 실제 send_date가 아니라 '이야기 속 날짜'의 기준점. 이 채팅에만 귀속.
 // send_date는 "내가 언제 쳤나"라 작중 시간과 무관하다 — 하루에 작중 3개월을 쓸 수도 있다 (현이 지적, 2026-09-20)
 const STORY_ANCHOR_META_KEY = 'jevLorebookStoryAnchor';
+// 직전 변환 되돌리기 스냅샷 (v0.11.0) — chat_metadata에 두어 이 채팅에만 귀속시킨다.
+// 변환은 다섯 가지를 한꺼번에 바꾼다(항목 추가 / 코어 덮어쓰기 / 변환 지점 / 작중 앵커 / 원본 숨김).
+const UNDO_META_KEY = 'jevLorebookUndo';
 const DEFAULT_SLICE_TOKENS = 18000; // 슬라이스당 대화 토큰 상한 기본값. v0.7.0에서 설정으로 개방
 const REAL_GAP_HOURS = 6;           // 실제 시간이 이만큼 벌어지면 전사에 장면 경계 힌트를 남긴다 (약한 힌트일 뿐)
 const CORE_COMMENT = '⭐ Core Memory';   // 코어 메모리 항목 식별자 (comment 고정 = upsert 키)
@@ -1212,19 +1215,21 @@ async function generateConversion(ctx, systemPrompt, userPrompt) {
  * (b) 공통: 끝줄이 문장으로 안 닫혔 있다.
  * 경고만 하고 결과는 버리지 않는다 — API 호출 N번을 날리는 게 더 비싸다.
  */
-async function collectTruncationWarnings(warnings, text, maxTokens, label, { checkTail = true } = {}) {
+async function detectTruncation(text, maxTokens, label, { checkTail = true } = {}) {
+    const found = [];
     // (a) v0.10.0부터 현재 연결 경로도 같은 상한(responseLength)을 쓰므로 양쪽에서 돈다.
     try {
         const used = await getTokenCountAsync(String(text ?? ''));
         if (used >= Math.floor(maxTokens * TRUNCATION_RATIO)) {
-            warnings.push(`${label}: 응답이 ${used.toLocaleString()}토큰으로 상한(${maxTokens.toLocaleString()})에 닿았어요 — 설정의 '변환 응답 최대 토큰'을 늘려 보세요`);
+            found.push(`${label}: 응답이 ${used.toLocaleString()}토큰으로 상한(${maxTokens.toLocaleString()})에 닿았어요 — 설정의 '변환 응답 최대 토큰'을 늘려 보세요`);
         }
     } catch (error) {
         console.warn(`${LOG} ${label} 응답 토큰 계산 실패 (잘림 감지 (a) 건너뜀): ${error?.message ?? error}`);
     }
     if (checkTail && looksTruncated(text)) {
-        warnings.push(`${label}: 응답이 문장 중간에서 끊긴 것 같아요 — 설정의 '변환 응답 최대 토큰'을 늘려 보세요`);
+        found.push(`${label}: 응답이 문장 중간에서 끊긴 것 같아요 — 설정의 '변환 응답 최대 토큰'을 늘려 보세요`);
     }
+    return found;
 }
 
 /**
@@ -1339,6 +1344,9 @@ async function convertChatToLorebook(setStatus) {
     }
     const keepRecent = Number.isFinite(Number(settings.keepRecent)) ? Math.max(0, Number(settings.keepRecent)) : defaultSettings.keepRecent;
     const startIndex = Math.max(0, Number(ctx.chatMetadata?.[CONVERT_META_KEY]) || 0);
+    // 되돌리기 스냅샷용 — 덮어쓰기 전 값을 원본 그대로 잡아둔다 (없었으면 undefined)
+    const prevMarker = ctx.chatMetadata?.[CONVERT_META_KEY];
+    const prevAnchor = ctx.chatMetadata?.[STORY_ANCHOR_META_KEY];
     const endIndex = chat.length - keepRecent; // 보존 버퍼 경계 — 변환·숨김 모두 여기까지만
     const fresh = endIndex > startIndex ? collectFreshMessages(chat, startIndex, endIndex) : [];
     if (!fresh.length) {
@@ -1374,8 +1382,20 @@ async function convertChatToLorebook(setStatus) {
             setStatus(`요약 생성 중… ${i + 1}/${slices.length} (${getConvertProfileLabel()})`);
             const transcript = sliceToTranscript(slices[i]);
             const prompt = `[Anchor: ${anchor || 'unknown'}]\n\n[Transcript]\n${transcript}`;
-            const { text: raw } = await generateConversion(ctx, incidentsPrompt, prompt);
-            await collectTruncationWarnings(warnings, raw, maxTokens, label);
+            // A(v0.11.0): 잘림이 잡힐 그 슬라이스만 1회 재생성한다.
+            // 코어는 v0.7.0부터 2회 시도였는데 사건 쪽은 0회였다 — 잘린 요약이 그대로 박히는 유일한 경로였다.
+            let raw = '';
+            let sliceWarnings = [];
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                const attemptLabel = attempt === 1 ? label : `${label}(재시도)`;
+                if (attempt > 1) setStatus(`잘림 감지 — 재생성 중… ${i + 1}/${slices.length} (${getConvertProfileLabel()})`);
+                const generated = await generateConversion(ctx, incidentsPrompt, prompt);
+                raw = generated.text;
+                sliceWarnings = await detectTruncation(raw, maxTokens, attemptLabel);
+                if (!sliceWarnings.length) break;
+                console.warn(`${LOG} ${attemptLabel} — 잘림 의심: ${sliceWarnings.join(' / ')}`);
+            }
+            warnings.push(...sliceWarnings);
             const parsed = parseConversionOutput(raw);
             if (!parsed.incidents.length) {
                 warnings.push(`${label}: 출력 ${String(raw ?? '').length}자에서 사건 헤더를 하나도 못 찾았어요 (형식 불일치)`);
@@ -1402,11 +1422,12 @@ async function convertChatToLorebook(setStatus) {
                 // 코어는 라벨·불릿 포맷이라 문장으로 안 끝나는 게 정상 → 끝줄 검사를 끈다.
                 // 구조 검증은 아래 parsed.core (### CORE STATE 섹션 유무)가 이미 맡고 있다.
                 const { text: raw } = await generateConversion(ctx, CORE_PROMPT, corePrompt);
-                await collectTruncationWarnings(warnings, raw, maxTokens, label, { checkTail: false });
+                const coreWarnings = await detectTruncation(raw, maxTokens, label, { checkTail: false });
                 const parsed = parseConversionOutput(raw);
                 if (parsed.core) {
                     coreState = parsed.core;
                     coreUpdated = true;
+                    warnings.push(...coreWarnings); // 채택한 응답의 경고만 남긴다 — 버린 시도의 경고는 소음이다
                 } else {
                     coreFailReason = `${label}: 응답에 ### CORE STATE 섹션이 없거나 본문이 비었어요`;
                     console.warn(`${LOG} ${coreFailReason}`);
@@ -1432,11 +1453,13 @@ async function convertChatToLorebook(setStatus) {
             }
         }
         const batchByDate = new Map();
+        const addedUids = []; // 되돌리기용 — 이번 변환이 만든 항목만 정확히 지우기 위해 모은다
         for (const inc of incidents) {
             const entry = createWorldInfoEntry(world, worldData);
             if (!entry) {
                 throw new Error('로어북 항목 uid 할당 실패');
             }
+            addedUids.push(entry.uid);
             const seen = batchByDate.get(inc.date) ?? 0;
             batchByDate.set(inc.date, seen + 1);
             const n = (existingByDate.get(inc.date) ?? 0) + seen + 1;
@@ -1451,6 +1474,7 @@ async function convertChatToLorebook(setStatus) {
             entry.disable = false;
         }
 
+        let prevCore = null; // 되돌리기용 — 코어는 upsert라 덮어쓰면 이전 본문이 사라진다
         // 2b. 코어 메모리 upsert — constant:true = ST가 매턴 네이티브 주입 (Jev 판정·색인 밖 — 설계 의도)
         //     갱신에 실패했으면 기존 코어 항목은 건드리지 않는다 (덮어쓸 새 값이 없다).
         if (coreState && coreUpdated) {
@@ -1459,10 +1483,14 @@ async function convertChatToLorebook(setStatus) {
                 console.warn(`${LOG} 코어 스냅샷 ${coreTokens}토큰 — 상한 ${CORE_TOKEN_LIMIT} 초과 (자르지 않고 그대로 저장, 다음 변환에서 재압축됨)`);
             }
             let coreEntry = findCoreEntry(worldData);
-            if (!coreEntry) {
+            if (coreEntry) {
+                // 되돌리기용: 코어는 upsert라 덮어쓰면 이전 본문이 사라진다
+                prevCore = { uid: coreEntry.uid, content: String(coreEntry.content ?? ''), existed: true };
+            } else {
                 coreEntry = createWorldInfoEntry(world, worldData);
                 if (!coreEntry) throw new Error('코어 항목 uid 할당 실패');
                 coreEntry.comment = CORE_COMMENT;
+                prevCore = { uid: coreEntry.uid, content: '', existed: false };
             }
             coreEntry.key = [];
             coreEntry.order = CORE_ORDER; // 일반 항목(기본 100)보다 위 — 프롬프트 최상단 고정
@@ -1482,6 +1510,18 @@ async function convertChatToLorebook(setStatus) {
         ctx.chatMetadata[CONVERT_META_KEY] = endIndex;
         const lastDate = incidents[incidents.length - 1]?.date;
         if (lastDate) ctx.chatMetadata[STORY_ANCHOR_META_KEY] = lastDate;
+        // C(v0.11.0): 되돌리기 스냅샷. 항목 저장이 끝난 뒤에 남긴다 — 저장이 실패했으면 되돌릴 것도 없다.
+        ctx.chatMetadata[UNDO_META_KEY] = {
+            ts: Date.now(),
+            world,
+            addedUids,
+            prevCore,
+            prevMarker: prevMarker ?? null,
+            prevAnchor: prevAnchor ?? null,
+            hiddenFrom: startIndex,
+            hiddenTo: endIndex - 1,
+            incidentCount: incidents.length,
+        };
         await ctx.saveMetadata();
 
         // 4. 자동 색인 (constant 제외)
@@ -1735,6 +1775,86 @@ async function openSplitDialog(setStatus, $panel) {
 
 // ── 세부 패널 (요술봉 메뉴) ─────────────────────────────────────────────
 
+/**
+ * 직전 변환 되돌리기 (v0.11.0).
+ * 항목 삭제 → 코어 복원 → 변환 지점·작중 앵커 원복 → 숨김 해제 → 재색인.
+ * 벡터는 재색인으로 청소한다(발주자 결정) — 삭제한 항목의 벡터가 남으면 '없는 항목'이 후보로 올라온다.
+ */
+async function undoLastConversion(setStatus) {
+    const ctx = SillyTavern.getContext();
+    const snap = ctx.chatMetadata?.[UNDO_META_KEY];
+    if (!snap || !snap.world) throw new Error('되돌릴 변환 기록이 없어요');
+    const worldData = await loadWorldInfo(snap.world);
+    if (!worldData) throw new Error(`로어북 '${snap.world}'을 찾지 못했어요`);
+
+    setStatus('추가된 항목 삭제 중…');
+    let removed = 0;
+    for (const uid of snap.addedUids ?? []) {
+        if (worldData.entries?.[String(uid)]) {
+            delete worldData.entries[String(uid)];
+            removed++;
+        }
+    }
+
+    let coreNote = '코어 변경 없음';
+    if (snap.prevCore) {
+        const key = String(snap.prevCore.uid);
+        if (snap.prevCore.existed) {
+            const entry = worldData.entries?.[key];
+            if (entry) {
+                entry.content = snap.prevCore.content;
+                coreNote = '코어 본문 복원';
+            } else {
+                coreNote = '코어 항목을 찾지 못해 복원 안 됨';
+            }
+        } else if (worldData.entries?.[key]) {
+            delete worldData.entries[key];
+            removed++;
+            coreNote = '코어 항목 삭제 (이번 변환에서 새로 만든 것)';
+        }
+    }
+    await saveWorldInfo(snap.world, worldData, true);
+    reloadEditor(snap.world);
+
+    // 값이 없었으면 키 자체를 지운다 — 0으로 덮으면 '첫 변환 전' 상태와 달라진다
+    if (snap.prevMarker === null || snap.prevMarker === undefined) delete ctx.chatMetadata[CONVERT_META_KEY];
+    else ctx.chatMetadata[CONVERT_META_KEY] = snap.prevMarker;
+    if (snap.prevAnchor === null || snap.prevAnchor === undefined) delete ctx.chatMetadata[STORY_ANCHOR_META_KEY];
+    else ctx.chatMetadata[STORY_ANCHOR_META_KEY] = snap.prevAnchor;
+    delete ctx.chatMetadata[UNDO_META_KEY];
+    await ctx.saveMetadata();
+
+    // 숨김 해제 — hideChatMessageRange(chats.js:147) 세 번째 인자 true = unhide
+    let unhidden = 0;
+    if (Number.isFinite(snap.hiddenFrom) && Number.isFinite(snap.hiddenTo) && snap.hiddenTo >= snap.hiddenFrom) {
+        setStatus('숨긴 메시지 복구 중…');
+        await hideChatMessageRange(snap.hiddenFrom, snap.hiddenTo, true);
+        unhidden = snap.hiddenTo - snap.hiddenFrom + 1;
+    }
+
+    setStatus('재색인 중…');
+    const indexed = await indexWorld(snap.world, setStatus);
+    lastConvertWarnings = [];
+    console.log(`${LOG} 되돌리기 완료 — 항목 ${removed}개 삭제 / ${coreNote} / 메시지 ${unhidden}개 복구 / ${indexed}개 재색인`);
+    return { removed, coreNote, unhidden, indexed };
+}
+
+/** 되돌리기 버튼 노출 — 스냅샷이 있을 때만 (v0.11.0) */
+function renderUndoButton($panel) {
+    const ctx = SillyTavern.getContext();
+    const snap = ctx.chatMetadata?.[UNDO_META_KEY];
+    const $btn = $panel.find('#jev_panel_undo');
+    if (!snap || !snap.world) {
+        $btn.hide();
+        return;
+    }
+    const when = new Date(Number(snap.ts) || Date.now());
+    const hh = String(when.getHours()).padStart(2, '0');
+    const mm = String(when.getMinutes()).padStart(2, '0');
+    $btn.find('span').text(`직전 변환 되돌리기 (${hh}:${mm} · ${Number(snap.incidentCount) || 0}건)`);
+    $btn.show();
+}
+
 /** 상태 요약 렌더 */
 function renderPanelSummary($panel) {
     const settings = getSettings();
@@ -1764,6 +1884,7 @@ function renderPanelSummary($panel) {
     $summary.append(row('변환 대상', convertWorld || '없음'));
     $summary.append(renderChatStack(ctx.chat ?? [], converted, keepRecent, chatLength));
     renderConvertProfileBadge($panel);
+    renderUndoButton($panel);
 }
 
 /**
@@ -2195,6 +2316,46 @@ async function openDetailPanel() {
             await renderPanelChunks($panel);
         } finally {
             $button.removeClass('disabled');
+        }
+    });
+
+    $panel.find('#jev_panel_undo').on('click', async function () {
+        const $button = $(this);
+        if ($button.hasClass('disabled')) return;
+        const snap = SillyTavern.getContext().chatMetadata?.[UNDO_META_KEY];
+        if (!snap) {
+            toastr.warning('되돌릴 변환 기록이 없어요.', 'Jev Lorebook');
+            renderPanelSummary($panel);
+            return;
+        }
+        const $confirm = $('<div>').append(
+            $('<p>').text('직전 변환을 되돌릴까요?'),
+            $('<ul>').append(
+                $('<li>').text(`추가된 항목 ${Number(snap.incidentCount) || 0}건 삭제`),
+                $('<li>').text('코어 메모리를 변환 전 본문으로 복원'),
+                $('<li>').text('변환 지점·작중 앵커 되돌림 (그 구간을 다시 변환할 수 있게 돼요)'),
+                $('<li>').text('숨긴 원본 메시지 복구'),
+                $('<li>').text('로어북 재색인 (임베딩 호출이 발생해요)'),
+            ),
+        );
+        const result = await callGenericPopup($confirm, POPUP_TYPE.CONFIRM, '', {
+            okButton: '되돌리기',
+            cancelButton: '취소',
+        });
+        if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+        $button.addClass('disabled');
+        try {
+            const r = await undoLastConversion(setConvertStatus);
+            setConvertStatus(`되돌리기 완료: 항목 ${r.removed}개 삭제 · ${r.coreNote} · 메시지 ${r.unhidden}개 복구 · ${r.indexed}개 재색인`);
+            toastr.success(`되돌렸어요 — 항목 ${r.removed}개 삭제, 메시지 ${r.unhidden}개 복구`, 'Jev Lorebook');
+        } catch (error) {
+            setConvertStatus(`되돌리기 실패: ${error?.message ?? error}`);
+            toastr.error(`되돌리기 실패: ${error?.message ?? error}`, 'Jev Lorebook');
+        } finally {
+            $button.removeClass('disabled');
+            renderPanelSummary($panel);
+            renderPanelWarnings($panel);
+            await renderPanelChunks($panel);
         }
     });
 
