@@ -354,29 +354,31 @@ Jev는 그 전제를 깹니다. 그래서 "매 턴, 후보 30개를 전부 읽�
 
 이미 vectors 확장을 쓰고 계셨다면 그 키를 그대로 씁니다.
 
-### ④ Jev로 보낼 통로 (CORS 우회)
+### ④ Jev로 보낼 통로 — 어느 쪽인지 **먼저 갈라야 합니다**
 
 브라우저에서 외부 API를 직접 부르는 건 보안 정책상 막혀 있습니다(CORS).
-그래서 SillyTavern 서버를 한 번 거쳐야 합니다. **둘 중 아무거나** 되면 됩니다.
+그래서 SillyTavern 서버를 한 번 거쳐야 합니다. 통로는 두 가지인데, **고르기 전에 이것부터 확인하세요.**
 
-**방법 A — 동봉된 `jev-proxy` 서버 플러그인**
+#### 🚦 갈림길 — `config.yaml`의 `basicAuthMode`
 
-⚠️ **URL로 확장만 설치하면 서버 플러그인은 자동으로 안 깔립니다** — 확장 설치와 서버 플러그인 설치는 별개 단계입니다. 아래 복사 단계를 반드시 따로 해 주세요.
+| `basicAuthMode` | 쓸 수 있는 통로 |
+|---|---|
+| `true` (아이디/비밀번호 로그인 켬) | **방법 A 전용. 선택지가 없습니다.** |
+| `false` | 방법 A · 방법 B 둘 다 가능 (방법 A 권장) |
 
-1. 이 저장소의 `server-plugin/` 폴더를 아래 위치에 `jev-proxy` 라는 이름으로 복사합니다.
+> **로그인을 켠 서버에서 방법 B는 구조적으로 불가능합니다.**
+> 방법 B는 SillyTavern 자신의 주소(`/proxy/...`)를 거칩니다. 그런데 Jev 키를 실을 수 있는 칸이 `Authorization` 헤더 **하나뿐**인데, 그 칸은 이미 브라우저가 로그인 인증에 쓰고 있습니다. 한 칸을 둘이 나눠 쓸 수 없습니다.
+> Jev API는 `Authorization: Bearer` 외의 방식(`X-Api-Key`, 쿼리 파라미터 등)을 받지 않습니다. 그래서 우회로가 없습니다.
+> 무리해서 쓰면 **롤플레이 도중 브라우저 로그인 창이 튀어나오고 요청이 멈춥니다.** 로그인을 켰다면 고민하지 말고 방법 A로 가세요.
 
-   ```
-   SillyTavern/plugins/jev-proxy/index.js
-   ```
+#### 방법 A — 동봉된 `jev-proxy` 서버 플러그인 (권장 / 로그인 서버는 필수)
 
-2. `config.yaml`에서 `enableServerPlugins: true` 로 바꾸고 서버 재시작.
-   (자작 플러그인만 쓸 거면 `enableServerPluginsAutoUpdate: false` 권장)
+파일 복사 + `config.yaml` 한 줄 + 서버 재시작이 필요합니다.
+설치 절차는 **[4-2 설치](#4-2-설치)에 한 곳으로 모아두었습니다.** 거기만 따라 하시면 됩니다.
 
-**방법 B — SillyTavern 내장 CORS 프록시**
+#### 방법 B — SillyTavern 내장 CORS 프록시 (로그인 안 켠 서버 전용)
 
-`config.yaml`에서 `enableCorsProxy: true`. 플러그인 설치가 필요 없습니다.
-
-> ⚠️ 단, **basicAuth(아이디/비밀번호 로그인)를 켠 서버에서는 이 방법이 동작하지 않습니다.** 인증 헤더가 충돌합니다. 이 경우 방법 A를 쓰세요.
+`config.yaml`에서 `enableCorsProxy: true` 로 바꾸고 서버 재시작. 플러그인 설치가 필요 없습니다.
 
 **확장이 세션마다 한 번씩 자동으로 감지해서 되는 쪽을 씁니다.** 현재 어느 경로를 쓰는지 패널에 표시됩니다.
 
@@ -396,15 +398,43 @@ SillyTavern/public/scripts/extensions/third-party/lorebook-triage/
 
 여기에 저장소 내용을 넣고 브라우저 새로고침.
 
-### 서버 플러그인 설치 (방법 A를 쓸 경우에만)
+### 서버 플러그인 설치 — 방법 A를 쓴다면 **이 3단계를 전부** 하셔야 합니다
 
-이 저장소의 `server-plugin/` 폴더를 아래 위치에 `jev-proxy` 라는 이름으로 복사합니다.
+> ⚠️ **가장 흔한 실패:** `config.yaml`의 `enableServerPlugins: true` 만 켜고 **파일을 복사하지 않는 것.**
+> 확장 설치(위)와 서버 플러그인 설치(여기)는 **완전히 별개**입니다.
+> SillyTavern의 URL 설치 기능은 **확장만** 내려받습니다. 서버 플러그인은 URL 설치 경로가 아예 없어서, `server-plugin/` 폴더는 확장 폴더 안에 그대로 앉아만 있습니다. **손으로 옮겨야 합니다.**
+
+**1단계 — 파일 복사 (먼저 하세요)**
+
+확장 폴더 안의 `server-plugin/` 을 SillyTavern의 `plugins/` 아래에 **`jev-proxy` 라는 이름으로** 복사합니다.
 
 ```
-SillyTavern/plugins/jev-proxy/index.js
+(복사 전)  SillyTavern/public/scripts/extensions/third-party/lorebook-triage/server-plugin/index.js
+(복사 후)  SillyTavern/plugins/jev-proxy/index.js
 ```
 
-그다음 `config.yaml`에서 `enableServerPlugins: true` 로 바꾸고 서버 재시작.
+명령줄로 한다면, SillyTavern 폴더에서:
+
+```bash
+cp -R public/scripts/extensions/third-party/lorebook-triage/server-plugin plugins/jev-proxy
+```
+
+**2단계 — `config.yaml` 수정**
+
+```yaml
+enableServerPlugins: true
+enableServerPluginsAutoUpdate: false   # 자작 플러그인만 쓸 거면 권장
+```
+
+**3단계 — 서버 재시작**
+
+`config.yaml`과 플러그인은 **시작할 때 한 번만** 읽습니다. 재시작하지 않으면 아무 일도 일어나지 않습니다.
+
+**확인 — 제대로 됐는지 보는 법**
+
+- 재시작 직후 서버 콘솔에 `1 server plugin(s) are currently loaded.` 같은 줄이 뜹니다.
+- 확장 패널의 통로 표시가 **`서버 플러그인 (jev-proxy)`** 로 바뀝니다.
+- 둘 다 아니면 1단계 경로를 다시 보세요. 최종 파일이 정확히 `SillyTavern/plugins/jev-proxy/index.js` 여야 합니다.
 
 ## 4-3. 첫 세팅 (한 번만)
 
