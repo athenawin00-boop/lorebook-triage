@@ -1947,27 +1947,71 @@ function populateEmbeddingSourceSelect() {
     $select.val(EMBEDDING_SOURCES[settings.embeddingSource] ? settings.embeddingSource : 'palm');
 }
 
+/**
+ * ST의 'API 연결' 서랍을 연다 (v0.7.0).
+ * 내비 서랍 토글은 $('.drawer-toggle').on('click', doNavbarIconClick) (script.js:12088)에 걸려 있고,
+ * 아이콘(#API-status-top)은 그 .drawer-toggle의 자식이라 클릭이 버블링된다.
+ * openWorldEditor의 #WIDrawerIcon 수법과 같은 경로 — 새 API를 쓰지 않는다.
+ * 닫힌 상태(closedDrawer, index.html:2277)일 때만 누른다 — 열린 걸 다시 누르면 닫혀 버린다.
+ */
+function openApiConnectionsDrawer() {
+    if ($('#rm_api_block').hasClass('closedDrawer')) {
+        $('#API-status-top').trigger('click');
+    }
+}
+
+/**
+ * 키 등록 경로 안내문 조립 (v0.7.0).
+ * 소스마다 키를 넣는 화면이 다르다 — ST 소스 실측:
+ *   chat    : chat_completion_source 드롭다운에 있는 소스 (index.html:2900~)
+ *   text    : togetherai만 Text Completion 쪽 (index.html:2435)
+ *   vectors : nomicai는 API 연결 화면에 칸 자체가 없고 Vector Storage 설정에서 관리 (vectors/settings.html:181)
+ * 소스 이름은 label이 아니라 stSource를 쓴다 — label엔 '(모델 고정: …)' 같은 우리 주석이 붙어 있어
+ * 그대로 안내하면 ST 드롭다운에서 그 항목을 못 찾는다.
+ */
+function buildKeyGuide(meta) {
+    const lines = ['이 키는 확장이 따로 받지 않고 SillyTavern에 저장된 키를 그대로 써요.'];
+    if (meta.keyRoute === 'vectors') {
+        lines.push(`등록: 확장 메뉴 → Vector Storage 설정에서 소스를 '${meta.stSource}'로 고르면 나오는 API 키 칸에 넣어 주세요.`);
+        return { lines, punch: '', showButton: false };
+    }
+    const apiType = meta.keyRoute === 'text' ? 'Text Completion' : 'Chat Completion';
+    lines.push(`등록: 상단 🔌 API 연결 → API를 '${apiType}'으로 → 소스를 '${meta.stSource}'로 고른 뒤, API 키를 붙여넣고 [Connect]를 누르면 저장돼요.`);
+    // 진짜 함정은 이 줄이다: Claude로 RP하는 사람은 이 소스를 열 이유가 없어서 입력칸 자체를 못 본다 (현이 실사용 제보, 2026-09-20)
+    return { lines, punch: '저장되면 채팅 연결은 원래 쓰던 소스로 되돌려도 키는 그대로 남아요.', showButton: true };
+}
+
 /** 선택 소스의 키 상태·모델 입력칸 상태 갱신 */
 function updateEmbeddingSourceUi() {
     const settings = getSettings();
     const meta = EMBEDDING_SOURCES[settings.embeddingSource] ?? EMBEDDING_SOURCES.palm;
     const $status = $('#jev_lorebook_key_status');
     const $help = $('#jev_lorebook_key_help');
-    // 키 입력칸을 우리가 안 가지고 있다는 걸 명시해야 한다 — 설정탭에 칸이 없으니 최초 설치자는 어디에 넣는지 몰라 막힌다 (현이 실사용 제보, 2026-09-20).
-    // 진짜 함정은 마지막 줄이다: Claude로 RP하는 사람은 Gemini 소스를 열 이유가 없어서 입력칸 자체를 못 본다.
+    // 키 입력칸을 우리가 안 가지고 있다는 걸 명시해야 한다 — 설정탭에 칸이 없으니 최초 설치자는 어디에 넣는지 몰라 막힌다.
     if (meta.secretKey === null) {
         $status.text('로컬 소스라 API 키가 필요 없어요.').removeClass('jev-key-missing');
-        $help.hide().empty();
+        $help.hide().empty(); // 키가 필요 없는 소스엔 안내 자체가 소음이다
     } else if (secret_state[meta.secretKey]) {
         $status.text('키 등록됨 ✓').removeClass('jev-key-missing');
         $help.hide().empty(); // 끝난 사람한테 잔소리하지 않는다
     } else {
         $status.text('키 미등록 ✗').addClass('jev-key-missing');
-        $help.empty()
-            .append($('<div>').text('이 키는 확장이 따로 받지 않고 SillyTavern에 저장된 키를 그대로 써요.'))
-            .append($('<div>').text(`등록: 상단 🔌 API 연결 → API를 'Chat Completion'으로 → 소스를 '${meta.label}'로 고른 뒤, API 키를 붙여넣고 [Connect]를 누르면 저장돼요.`))
-            .append($('<div>').addClass('jev-key-help-punch').text('저장되면 채팅 연결은 원래 쓰던 소스로 되돌려도 키는 그대로 남아요.'))
-            .show();
+        const guide = buildKeyGuide(meta);
+        $help.empty();
+        for (const line of guide.lines) {
+            $help.append($('<div>').text(line));
+        }
+        if (guide.punch) {
+            $help.append($('<div>').addClass('jev-key-help-punch').text(guide.punch));
+        }
+        if (guide.showButton) {
+            $help.append($('<div id="jev_lorebook_open_api" class="menu_button menu_button_icon">')
+                .attr('title', 'SillyTavern의 API 연결 서랍을 열어요')
+                .append($('<i class="fa-solid fa-plug">'))
+                .append($('<span>').text('API 연결 열기'))
+                .on('click', openApiConnectionsDrawer));
+        }
+        $help.show();
     }
     const $model = $('#jev_lorebook_embed_model');
     $model.prop('disabled', !meta.modelFromRequest);

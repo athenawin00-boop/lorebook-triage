@@ -197,6 +197,12 @@
     font-weight: 600;
 }
 
+/* 안내 안의 [API 연결 열기] — 블록 폭을 다 먹지 않게 자기 너비만 쓴다 */
+.jev-key-help #jev_lorebook_open_api {
+    display: inline-flex;
+    margin-top: 8px;
+}
+
 .jev-profile-row {
     display: flex;
     flex-direction: column;
