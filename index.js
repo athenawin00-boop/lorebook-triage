@@ -23,6 +23,7 @@ import { getTokenCountAsync } from '../../../tokenizers.js';
 import { getStringHash, timestampToMoment, getCharaFilename } from '../../../utils.js';
 import { callGenericPopup, POPUP_TYPE, POPUP_RESULT } from '../../../popup.js';
 import { secret_state, SECRET_KEYS } from '../../../secrets.js';
+import { oai_settings } from '../../../openai.js';
 import { ConnectionManagerRequestService } from '../../shared.js';
 import { hideChatMessageRange } from '../../../chats.js';
 
@@ -170,6 +171,7 @@ let lastConvertWarnings = [];
 //              (label엔 '(모델 고정: …)' 같은 우리 주석이 붙어 있어 그대로 안내하면 못 찾는다)
 const EMBEDDING_SOURCES = {
     palm:         { label: 'Google AI Studio (Gemini)', secretKey: SECRET_KEYS.MAKERSUITE, modelFromRequest: true, defaultModel: 'gemini-embedding-001', keyRoute: 'chat', stSource: 'Google AI Studio' }, // text-embedding-005는 404 — 실측
+    vertexai:     { label: 'Google Vertex AI', secretKey: SECRET_KEYS.VERTEXAI, altSecretKey: SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT, modelFromRequest: true, defaultModel: 'text-embedding-005', keyRoute: 'chat', stSource: 'Google Vertex AI' }, // Vertex에선 text-embedding-005가 정상 모델이다 (404는 AI Studio 한정)
     transformers: { label: 'Local (Transformers) — 키 불필요', secretKey: null, modelFromRequest: false, defaultModel: '', keyRoute: null, stSource: '' },
     openai:       { label: 'OpenAI', secretKey: SECRET_KEYS.OPENAI, modelFromRequest: true, defaultModel: 'text-embedding-3-small', keyRoute: 'chat', stSource: 'OpenAI' },
     cohere:       { label: 'Cohere', secretKey: SECRET_KEYS.COHERE, modelFromRequest: true, defaultModel: 'embed-english-v3.0', keyRoute: 'chat', stSource: 'Cohere' },
@@ -182,6 +184,16 @@ const EMBEDDING_SOURCES = {
     siliconflow:  { label: 'SiliconFlow', secretKey: SECRET_KEYS.SILICONFLOW, modelFromRequest: true, defaultModel: 'Qwen/Qwen3-Embedding-0.6B', keyRoute: 'chat', stSource: 'SiliconFlow' },
     chutes:       { label: 'Chutes', secretKey: SECRET_KEYS.CHUTES, modelFromRequest: true, defaultModel: 'chutes-qwen-qwen3-embedding-8b', keyRoute: 'chat', stSource: 'Chutes' },
 };
+
+/**
+ * 이 소스의 키가 ST에 저장돼 있는지. Vertex만 시크릿이 두 갈래다
+ * (Express Mode = api_key_vertexai / Service Account = vertexai_service_account_json) —
+ * 내장 vectors도 둘 중 하나만 있으면 통과시킨다 (extensions/vectors/index.js:1081).
+ */
+function hasEmbeddingKey(meta) {
+    if (!meta || meta.secretKey === null) return true;
+    return Boolean(secret_state[meta.secretKey] || (meta.altSecretKey && secret_state[meta.altSecretKey]));
+}
 
 // 설정 숫자칸 범위 — UI(min/max)와 읽기 쪽 클램프가 같은 값을 써야 한다 (UI만 막으면 수동 설정 파일 편집을 못 막는다)
 const SLICE_TOKENS_MIN = 2000;
@@ -364,7 +376,31 @@ function getEmbeddingBody() {
     if (source === 'palm') {
         body.api = 'makersuite'; // vectors 클라 관례 (extensions/vectors/index.js:968~970)
     }
+    // Vertex는 인증모드·리전·프로젝트를 ST 메인 API 설정에서 가져다 실어야 한다 (extensions/vectors/index.js:972~977).
+    // 안 실으면 getGoogleApiConfig(endpoints/google.js:165)가 api !== 'vertexai'로 보고 AI Studio 경로로 새어나간다.
+    if (source === 'vertexai') {
+        body.api = 'vertexai';
+        body.vertexai_auth_mode = oai_settings?.vertexai_auth_mode;
+        body.vertexai_region = oai_settings?.vertexai_region;
+        body.vertexai_express_project_id = oai_settings?.vertexai_express_project_id;
+    }
     return body;
+}
+
+/**
+ * 벡터 API 실패를 '다음에 뭘 할지'가 보이는 문장으로 바꾼다 (v0.10.0).
+ * ST는 임베딩 제공자 오류를 전부 sendStatus(500)으로 뭉갠다(endpoints/vectors.js:466).
+ * 진짜 사유(키 무효·모델 이름·항목 길이·쿼터)는 서버 콘솔에만 찍히므로, 그 위치를 알려주는 게 유일한 단서다.
+ */
+async function vectorError(response, what) {
+    let detail = '';
+    try {
+        detail = String((await response.text()) ?? '').trim().slice(0, 300);
+    } catch { /* 본문 없음은 흔하다 — sendStatus는 상태 문자열만 준다 */ }
+    const hint = response.status >= 500
+        ? ' — SillyTavern 서버 콘솔(터미널)에 실제 사유가 찍혀 있어요: 임베딩 키·모델 이름·항목 길이·요청 한도를 확인해 주세요'
+        : '';
+    return new Error(`벡터 ${what} 실패 (HTTP ${response.status})${detail ? `: ${detail}` : ''}${hint}`);
 }
 
 async function vectorQuery(worldName, searchText, topK) {
@@ -380,7 +416,7 @@ async function vectorQuery(worldName, searchText, topK) {
         }),
     });
     if (!response.ok) {
-        throw new Error(`벡터 query 실패 (HTTP ${response.status})`);
+        throw await vectorError(response, 'query');
     }
     return await response.json(); // { hashes: number[], metadata: {hash,text,index}[] }
 }
@@ -396,7 +432,7 @@ async function vectorInsert(worldName, items) {
         }),
     });
     if (!response.ok) {
-        throw new Error(`벡터 insert 실패 (HTTP ${response.status})`);
+        throw await vectorError(response, 'insert');
     }
 }
 
@@ -407,7 +443,7 @@ async function vectorPurge(worldName) {
         body: JSON.stringify({ collectionId: getCollectionId(worldName) }),
     });
     if (!response.ok) {
-        throw new Error(`벡터 purge 실패 (HTTP ${response.status})`);
+        throw await vectorError(response, 'purge');
     }
 }
 
@@ -514,7 +550,7 @@ async function vectorList(worldName) {
         }),
     });
     if (!response.ok) {
-        throw new Error(`벡터 list 실패 (HTTP ${response.status})`);
+        throw await vectorError(response, 'list');
     }
     const hashes = await response.json();
     return new Set(Array.isArray(hashes) ? hashes.map(Number) : []);
@@ -1025,10 +1061,14 @@ function sliceToTranscript(slice) {
  * 응답 끝줄이 문장으로 닫혔는지 — 잘림 휴리스틱(양쪽 경로 공통).
  * 토큰 수 비교는 프로필 경로에서만 쓸 수 있다(현재 연결은 상한을 모른다) — 그래서 글자 모양으로도 한 번 더 본다.
  */
+const STRUCTURAL_TAIL_RE = /^(?:[-*_=]{3,}$|#{1,6}\s|>\s|\||\**\s*Keywords?\s*:|[-*•+]\s+|\d+[.)]\s+)/i;
 function looksTruncated(text) {
     const lines = String(text || '').split('\n').map(s => s.trim()).filter(Boolean);
     const last = lines[lines.length - 1];
     if (!last) return false;
+    // 우리 프롬프트가 시키는 구조적 줄(구분선·헤더·Keywords·불릿)은 문장부호로 안 끝나는 게 정상이다.
+    // 이걸 안 걸러서 정상 출력마다 오탐이 났다 (v0.10.0 수정).
+    if (STRUCTURAL_TAIL_RE.test(last)) return false;
     return !SENTENCE_END_RE.test(last);
 }
 
@@ -1140,9 +1180,10 @@ function resolveStoryAnchor(ctx, worldData, fresh) {
 async function generateConversion(ctx, systemPrompt, userPrompt) {
     const settings = getSettings();
     if (!settings.convertProfileId) {
-        // 현재 연결 경로는 ST의 응답 최대 토큰 설정을 그대로 따른다.
-        // generateRaw에 상한을 넘기지 않기로 했고(현이 결정, v0.7.0), 대신 패널과 경고로 알린다.
-        const text = await ctx.generateRaw({ prompt: userPrompt, systemPrompt });
+        // v0.10.0: 현재 연결 경로에도 같은 상한을 먹인다 (v0.7.0의 '안 넘긴다' 결정을 발주자 승인으로 뒤집음).
+        // generateRaw는 responseLength를 받아 TempResponseLength로 임시 교체 후 복원한다 (script.js:3947, 4063).
+        // 상한을 모르면 잘림 감지 (a)가 아예 못 돌아 끝줄 휴리스틱 하나에 매달리게 되고, 그게 오탐의 뿌리였다.
+        const text = await ctx.generateRaw({ prompt: userPrompt, systemPrompt, responseLength: getConvertMaxTokens() });
         return { text: String(text ?? ''), viaProfile: false };
     }
     let profileName = settings.convertProfileId;
@@ -1171,19 +1212,18 @@ async function generateConversion(ctx, systemPrompt, userPrompt) {
  * (b) 공통: 끝줄이 문장으로 안 닫혔 있다.
  * 경고만 하고 결과는 버리지 않는다 — API 호출 N번을 날리는 게 더 비싸다.
  */
-async function collectTruncationWarnings(warnings, text, viaProfile, maxTokens, label) {
-    if (viaProfile) {
-        try {
-            const used = await getTokenCountAsync(String(text ?? ''));
-            if (used >= Math.floor(maxTokens * TRUNCATION_RATIO)) {
-                warnings.push(`${label}: 응답이 ${used.toLocaleString()}토큰으로 상한(${maxTokens.toLocaleString()})에 닿았어요 — 뒷부분이 잘렸을 수 있어요`);
-            }
-        } catch (error) {
-            console.warn(`${LOG} ${label} 응답 토큰 계산 실패 (잘림 감지 (a) 건너뜀): ${error?.message ?? error}`);
+async function collectTruncationWarnings(warnings, text, maxTokens, label, { checkTail = true } = {}) {
+    // (a) v0.10.0부터 현재 연결 경로도 같은 상한(responseLength)을 쓰므로 양쪽에서 돈다.
+    try {
+        const used = await getTokenCountAsync(String(text ?? ''));
+        if (used >= Math.floor(maxTokens * TRUNCATION_RATIO)) {
+            warnings.push(`${label}: 응답이 ${used.toLocaleString()}토큰으로 상한(${maxTokens.toLocaleString()})에 닿았어요 — 설정의 '변환 응답 최대 토큰'을 늘려 보세요`);
         }
+    } catch (error) {
+        console.warn(`${LOG} ${label} 응답 토큰 계산 실패 (잘림 감지 (a) 건너뜀): ${error?.message ?? error}`);
     }
-    if (looksTruncated(text)) {
-        warnings.push(`${label}: 응답이 문장 중간에서 끓겼어요 — 응답 최대 토큰을 늘려 보세요`);
+    if (checkTail && looksTruncated(text)) {
+        warnings.push(`${label}: 응답이 문장 중간에서 끊긴 것 같아요 — 설정의 '변환 응답 최대 토큰'을 늘려 보세요`);
     }
 }
 
@@ -1334,8 +1374,8 @@ async function convertChatToLorebook(setStatus) {
             setStatus(`요약 생성 중… ${i + 1}/${slices.length} (${getConvertProfileLabel()})`);
             const transcript = sliceToTranscript(slices[i]);
             const prompt = `[Anchor: ${anchor || 'unknown'}]\n\n[Transcript]\n${transcript}`;
-            const { text: raw, viaProfile } = await generateConversion(ctx, incidentsPrompt, prompt);
-            await collectTruncationWarnings(warnings, raw, viaProfile, maxTokens, label);
+            const { text: raw } = await generateConversion(ctx, incidentsPrompt, prompt);
+            await collectTruncationWarnings(warnings, raw, maxTokens, label);
             const parsed = parseConversionOutput(raw);
             if (!parsed.incidents.length) {
                 warnings.push(`${label}: 출력 ${String(raw ?? '').length}자에서 사건 헤더를 하나도 못 찾았어요 (형식 불일치)`);
@@ -1359,8 +1399,10 @@ async function convertChatToLorebook(setStatus) {
         for (let attempt = 1; attempt <= 2 && !coreUpdated; attempt++) {
             const label = attempt === 1 ? '코어 갱신' : '코어 갱신(재시도)';
             try {
-                const { text: raw, viaProfile } = await generateConversion(ctx, CORE_PROMPT, corePrompt);
-                await collectTruncationWarnings(warnings, raw, viaProfile, maxTokens, label);
+                // 코어는 라벨·불릿 포맷이라 문장으로 안 끝나는 게 정상 → 끝줄 검사를 끈다.
+                // 구조 검증은 아래 parsed.core (### CORE STATE 섹션 유무)가 이미 맡고 있다.
+                const { text: raw } = await generateConversion(ctx, CORE_PROMPT, corePrompt);
+                await collectTruncationWarnings(warnings, raw, maxTokens, label, { checkTail: false });
                 const parsed = parseConversionOutput(raw);
                 if (parsed.core) {
                     coreState = parsed.core;
@@ -1715,7 +1757,7 @@ function renderPanelSummary($panel) {
     $summary.append(row('전송', jevTransport ? jevTransport.label : (lastTransportError ? `없음 — ${lastTransportError}` : '미감지 (첫 생성 때 자동으로 감지해요)')));
     const embedMeta = EMBEDDING_SOURCES[settings.embeddingSource] ?? EMBEDDING_SOURCES.palm;
     const embedModel = embedMeta.modelFromRequest ? (String(settings.embeddingModel || '').trim() || embedMeta.defaultModel) : '(서버 고정)';
-    const embedKey = embedMeta.secretKey === null ? '키 불필요' : (secret_state[embedMeta.secretKey] ? '키 등록됨 ✓' : '키 미등록 ✗');
+    const embedKey = embedMeta.secretKey === null ? '키 불필요' : (hasEmbeddingKey(embedMeta) ? '키 등록됨 ✓' : '키 미등록 ✗');
     $summary.append(row('임베딩', `${embedMeta.label} · ${embedModel} · ${embedKey}${settings.embeddingDirty ? ' · ⚠ 재색인 필요' : ''}`));
     $summary.append(row('변환 프로필', getConvertProfileLabel()));
     const keepRecent = Number.isFinite(Number(settings.keepRecent)) ? Math.max(0, Number(settings.keepRecent)) : defaultSettings.keepRecent;
@@ -2269,7 +2311,7 @@ function updateEmbeddingSourceUi() {
     if (meta.secretKey === null) {
         $status.text('로컬 소스라 API 키가 필요 없어요.').removeClass('jev-key-missing');
         $help.hide().empty(); // 키가 필요 없는 소스엔 안내 자체가 소음이다
-    } else if (secret_state[meta.secretKey]) {
+    } else if (hasEmbeddingKey(meta)) {
         $status.text('키 등록됨 ✓').removeClass('jev-key-missing');
         $help.hide().empty(); // 끝난 사람한테 잔소리하지 않는다
     } else {
