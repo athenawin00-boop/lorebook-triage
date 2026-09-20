@@ -40,8 +40,8 @@ const JEV_MODEL = 'jev-latest';
 const JEV_TIMEOUT_MS = 20000;
 const JEV_PROBE_TIMEOUT_MS = 8000;
 
-const QUERY_TOP_K = 20;          // 벡터 회수 후보 수
-const SCORE_FLOOR = 0.3;         // 최종 점수 하한 (미만은 채택 안 함)
+const QUERY_TOP_K = 30;          // 벡터 회수 후보 수 — 20으론 Jev 상위권을 놓침(2026-09-20 실측)
+const SCORE_FLOOR = 0.5;         // 최종 점수 하한. 대조실험 눈금: 0.74=빼면 모순 / 0.52=장면만 맞음 / 0.37=무관
 const QUERY_USER_MESSAGES = 3;   // 검색 쿼리로 쓸 최근 유저 메시지 수
 const SCENE_MESSAGES = 6;        // Jev에 보여줄 최근 장면 메시지 수
 const INSERT_CHUNK = 20;         // 색인 시 insert 배치 크기
@@ -396,13 +396,20 @@ function finalScore(scores) {
 
 // ── 컨텍스트 발췌 ───────────────────────────────────────────────────────
 
-/** 검색 쿼리: 최근 유저 메시지들 */
+/**
+ * 검색 쿼리: 최근 유저 메시지들 + 직전 캐릭터 응답 1개.
+ * 유저 발화만 쓰면 장면의 인물·장소 이름이 쿼리에서 빠진다 — 그건 대부분 캐릭 응답 쪽에 있다.
+ * 실측(2026-09-20): 직전 응답을 붙이면 Jev 상위 항목의 검색순위가 20위→20위 밖 → 2~7위로 올라온다.
+ */
 function buildQueryText(chat) {
     const userMessages = chat
         .filter(x => x.is_user && String(x.mes || '').trim())
         .slice(-QUERY_USER_MESSAGES)
         .map(x => String(x.mes));
-    return userMessages.join('\n').slice(-2000);
+    const base = userMessages.join('\n').slice(-2000);
+    const lastChar = [...chat].reverse().find(x => !x.is_user && String(x.mes || '').trim());
+    const tail = lastChar ? String(lastChar.mes) : '';
+    return (tail ? `${base}\n${tail}` : base).slice(-2000);
 }
 
 /** Jev에 보여줄 최근 장면 발췌 */
