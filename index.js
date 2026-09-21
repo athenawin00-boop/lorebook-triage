@@ -580,19 +580,103 @@ function approxTokens(text) {
     return Math.max(1, Math.round(String(text ?? '').length / 4));
 }
 
+// ── 로어북 매니저(simple-lorebook) 번역본 읽기 (v0.16.0) ─────────────────────
+// 타 확장 'Lorebook Manager'가 저장한 번역을 **읽기만** 한다.
+//   저장 위치: extension_settings['simple-lorebook'].translations
+//   키       : `${book}\u241f${uid}`  (U+241F UNIT SEPARATOR)
+//   레코드   : { book, uid, sourceLanguage, language, sourceHash, text, updatedAt }
+// 규칙(현이 결정):
+//   1) 저쪽 저장소에 쓰기 금지 — saveSettingsDebounced도 저쪽 데이터에 대해선 호출하지 않는다.
+//      (매니저 본체는 폴백 히트 시 정확키를 채워넣지만, 우리는 남의 집 가구를 옮기지 않는다.)
+//   2) sourceHash 불일치라도 경고·배지 없음. 매니저가 다음 열람 때 스스로 갱신한다.
+//   3) 매니저 미설치/자료구조 파손이어도 기존 기능 무손상 — 전부 try/catch + 타입 가드, 실패 시 null.
+const MANAGER_EXT = 'simple-lorebook';
+const MANAGER_KEY_SEP = '\u241f';
+const MANAGER_LANGUAGE_LABELS = { Korean: '한국어', English: '영어' };
+
+/**
+ * 매니저의 hashText() 재구현 (FNV-1a 32bit + `_길이`).
+ * 저쪽 파일을 import하지 않는다 — 로드 순서 의존이 생기고, 미설치 시 확장 전체가 죽는다.
+ */
+function managerHashText(value) {
+    const text = String(value ?? '');
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index++) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619) >>> 0;
+    }
+    return `${hash.toString(36)}_${text.length}`;
+}
+
+/** 번역 레코드 → 표시용 형태. 본문이 비면 없는 것으로 친다. */
+function normalizeManagerRecord(record) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+    const text = typeof record.text === 'string' ? record.text : '';
+    if (!text.trim()) return null;
+    return {
+        text,
+        language: typeof record.language === 'string' ? record.language : '',
+        updatedAt: record.updatedAt ?? null,
+    };
+}
+
+/**
+ * @returns {{text: string, language: string, updatedAt: *}|null}
+ * 1차 = 정확키(world+uid만 필요 — 판정표의 박제 본문처럼 원문이 달라져도 맞는다).
+ * 2차 = 전체 스캔 폴백(uid + sourceHash 일치). 구분자가 바뀐 옛 데이터 대비, 매니저 자체 폴백과 같은 방식.
+ */
+function getManagerTranslation(world, uid, sourceText) {
+    try {
+        const store = extension_settings?.[MANAGER_EXT];
+        if (!store || typeof store !== 'object' || Array.isArray(store)) return null;
+        const translations = store.translations;
+        if (!translations || typeof translations !== 'object' || Array.isArray(translations)) return null;
+
+        const exact = normalizeManagerRecord(translations[`${world}${MANAGER_KEY_SEP}${uid}`]);
+        if (exact) return exact;
+
+        const source = String(sourceText ?? '');
+        if (!source) return null;
+        const sourceHash = managerHashText(source);
+        for (const record of Object.values(translations)) {
+            if (!record || typeof record !== 'object') continue;
+            if (String(record.uid) !== String(uid)) continue;
+            if (record.sourceHash !== sourceHash) continue;
+            const hit = normalizeManagerRecord(record);
+            if (hit) return hit;
+        }
+        return null;
+    } catch (err) {
+        return null;
+    }
+}
+
 /**
  * 전문 펼침 셀 + 상세 행 (v0.6.4).
  * PC·폰 동일하게 클릭 하나. hover는 폰에 없어서 쓰지 않는다.
  * 여러 행을 동시에 펼칠 수 있고(항목끼리 비교용), 높이 제한은 두지 않는다(현이 결정).
+ * v0.16.0: meta({world, uid})를 주면 로어북 매니저 번역본을 원문 아래에 자동으로 함께 보여준다.
  */
-function buildDetailToggle(content, colSpan) {
+function buildDetailToggle(content, colSpan, meta = null) {
     const $toggle = $('<span class="jev-detail-toggle" role="button" tabindex="0">')
         .attr('title', '이 항목의 본문 전문을 펼쳐서 봐요')
         .append($('<i class="fa-solid fa-chevron-down">'))
         .append($('<span>').text('전문'));
 
-    const $detail = $('<tr class="jev-detail-row" style="display: none;">')
-        .append($('<td>').attr('colspan', colSpan).append($('<div class="jev-detail-body">').text(String(content ?? ''))));
+    const $detailCell = $('<td>').attr('colspan', colSpan)
+        .append($('<div class="jev-detail-body">').text(String(content ?? '')));
+
+    // 번역 레코드가 없으면 아무것도 그리지 않는다(빈 상태 UI 없음 — 현이 결정).
+    const translation = meta ? getManagerTranslation(meta.world, meta.uid, String(content ?? '')) : null;
+    if (translation) {
+        const label = MANAGER_LANGUAGE_LABELS[translation.language] || '';
+        $detailCell.append($('<div class="jev-detail-translation">')
+            .append($('<div class="jev-detail-translation-caption">')
+                .text(label ? `로어북 매니저 번역 · ${label}` : '로어북 매니저 번역'))
+            .append($('<div class="jev-detail-translation-body">').text(translation.text)));
+    }
+
+    const $detail = $('<tr class="jev-detail-row" style="display: none;">').append($detailCell);
 
     const toggleDetail = () => {
         const opening = $detail.css('display') === 'none';
@@ -2640,7 +2724,7 @@ function renderPanelJudgment($box, rejected) {
             $tr.append($('<td>').text(r.tokens ?? '—'));
 
             // 전문 펼치기(v0.6.4) — 점수만 보고는 왜 빠졌는지 몰라서 여기가 제일 많이 쓰인다.
-            const { $cell, $detail } = buildDetailToggle(r.text, headers.length);
+            const { $cell, $detail } = buildDetailToggle(r.text, headers.length, { world, uid: r.uid });
             $tr.append($cell);
             $tbody.append($tr).append($detail);
         }
@@ -2709,7 +2793,7 @@ async function renderPanelChunks($panel) {
             $tr.append($('<td>').text(approxTokens(content)));
             $tr.append(buildCoreToggle(world, e.uid, false, $panel));
 
-            const { $cell, $detail } = buildDetailToggle(content, 6);
+            const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid });
             $tr.append($cell);
             $tbody.append($tr).append($detail);
         }
@@ -2761,7 +2845,7 @@ async function renderPanelChunks($panel) {
                 $tr.append($('<td>').text(approxTokens(content)));
                 $tr.append(buildCoreToggle(world, e.uid, true, $panel));
 
-                const { $cell, $detail } = buildDetailToggle(content, 6);
+                const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid });
                 $tr.append($cell);
                 $coreBody.append($tr).append($detail);
             }
@@ -2872,7 +2956,7 @@ function renderPanelInjected($panel) {
             $tr.append($tok);
 
             // 전문 펼침은 기존 패턴 재사용 (buildDetailToggle, v0.6.4)
-            const { $cell, $detail } = buildDetailToggle(content, headers.length);
+            const { $cell, $detail } = buildDetailToggle(content, headers.length, { world: r.entry.world, uid: r.entry.uid });
             $tr.append($cell);
             $tbody.append($tr).append($detail);
 

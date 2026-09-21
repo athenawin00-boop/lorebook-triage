@@ -563,3 +563,23 @@
     border-left: 2px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
     margin-top: 6px;
 }
+
+/* ── 로어북 매니저 번역본 (v0.16.0) ──────────────────────
+   타 확장(simple-lorebook)이 저장해 둔 번역을 전문 펼침 안에서 읽기 전용으로 보여준다.
+   원문과 번역 사이는 선 하나로만 가른다 — 버튼도 배지도 두지 않는다(현이 결정). */
+.jev-detail-translation {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+}
+
+.jev-detail-translation-caption {
+    font-size: 0.82em;
+    opacity: 0.55;
+    margin-bottom: 4px;
+}
+
+.jev-detail-translation-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
