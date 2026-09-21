@@ -1,4 +1,9 @@
-.jev-lorebook-settings .inline-drawer-content {
+/* ⚠ 레이아웃(flex·gap)은 ST가 표시/숨김을 제어하는 서랍 컨테이너가 아니라
+   안쪽 래퍼(.jev-set-body)에 건다 (v0.15.0).
+   그 컨테이너에 display를 걸면 ST 기본값(public/style.css:5535 의 display:none)을
+   클래스 2개짜리 specificity로 이겨서 서랍이 처음부터 펼쳐진 채 뜬다.
+   여닫기는 jQuery slideToggle이 인라인 display를 박아 멀쩡해 보이므로 클릭 테스트로는 안 잡힌다. */
+.jev-lorebook-settings .jev-set-body {
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -516,6 +521,30 @@
 
 .jev-kind-badge.jev-kind-keyword {
     opacity: 0.8;
+}
+
+/* 🎲 랜덤 주입 (v0.15.0) — 판정을 안 거친 항목이라 🧠와 다른 색을 준다 */
+.jev-kind-badge.jev-kind-random {
+    border-color: var(--warning, rgba(230, 170, 60, 0.8));
+}
+
+/* 남겨둘 최근 챗 수 — 챗 적치 막대 바로 아래 미리보기 입력 (v0.15.0) */
+.jev-keep-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0 2px;
+}
+
+.jev-keep-row label {
+    white-space: nowrap;
+    font-size: 0.9em;
+    opacity: 0.85;
+}
+
+.jev-keep-row input[type="number"] {
+    width: 7em;
+    flex: 0 0 auto;
 }
 
 /* ── Jev 탈락 후보 접힘 블록 (v0.9.1) ──────────────────

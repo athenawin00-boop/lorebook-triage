@@ -217,6 +217,16 @@ let lastTransportError = null;
  * 토스트는 몇 초 뒤면 사라지는데 "잘렸을지도 모른다"는 나중에 확인하고 싶은 정보라 남긴다.
  */
 let lastConvertWarnings = [];
+/**
+ * 🎲 랜덤 주입 상태 (v0.15.0).
+ * recentRandomUids = 쿨다운 링버퍼(`${world}.${uid}`). 최근 뽑힌 건 한동안 다시 안 뽑는다. CHAT_CHANGED에서 비운다.
+ * lastRandomItems  = 직전 턴에 뽑힌 항목. 판정 캐시 히트 턴에는 새로 뽑지 않고 이걸 그대로 재주입한다
+ *                    (같은 턴의 연쇄 quiet 생성에서 주입물이 흔들리면 안 된다).
+ * lastRandomKeys   = 패널 「직전 턴」 표의 🎲 분류용 키 집합.
+ */
+let recentRandomUids = [];
+let lastRandomItems = [];
+let lastRandomKeys = new Set();
 
 // ── 임베딩 소스 (v0.5) — vectors 확장 지원 소스의 부분집합 ─────────────────
 // 제외: ollama/llamacpp/vllm/koboldcpp(서버 URL 필요), webllm(브라우저 모듈), vertexai(인증 모드 복잡),
@@ -269,6 +279,10 @@ const DEFAULT_CONVERT_MAX_TOKENS = 16384; // 구 v0.6.4는 4096 고정 — 18,00
 const INCIDENT_TOKENS_MIN = 100;
 const INCIDENT_TOKENS_MAX = 4000;
 const DEFAULT_INCIDENT_MAX_TOKENS = 500;
+// 🎲 랜덤 주입 예산 (v0.15.0) — 주입 예산(budgetTokens)과 별개 통이다. 0이면 랜덤은 돌지 않는다.
+const RANDOM_BUDGET_MIN = 0;
+const RANDOM_BUDGET_MAX = 20000;
+const DEFAULT_RANDOM_BUDGET = 500;
 
 const defaultSettings = Object.freeze({
     enabled: false,
@@ -294,6 +308,9 @@ const defaultSettings = Object.freeze({
     queryTopK: DEFAULT_TOP_K,                   // 벡터 회수 후보 수
     convertStyle: '',                           // 빈 값 = DEFAULT_CONVERT_STYLE 사용
     // ── v0.12.0 신규 ──
+    // ── v0.15.0 신규 ──
+    randomEnabled: false,                       // 🎲 랜덤 주입 (기본 꺼짐)
+    randomBudgetTokens: DEFAULT_RANDOM_BUDGET,  // 랜덤 전용 예산 — budgetTokens와 합산하지 않는다
     headerMigratedWorlds: [],                   // 본문 날짜 헤더 마이그레이션이 끝난 로어북 이름 (로어북당 1회용 마커)
 });
 
@@ -314,6 +331,16 @@ function getConvertMaxTokens() {
 
 function getIncidentMaxTokens() {
     return clampSetting(getSettings().incidentMaxTokens, INCIDENT_TOKENS_MIN, INCIDENT_TOKENS_MAX, DEFAULT_INCIDENT_MAX_TOKENS);
+}
+
+function getRandomBudget() {
+    return clampSetting(getSettings().randomBudgetTokens, RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
+}
+
+/** 변환·숨김에서 제외할 최근 메시지 수. 설정탭과 요술봉 패널 두 창구가 같은 값을 쓴다 (v0.15.0) */
+function getKeepRecent() {
+    const value = Number(getSettings().keepRecent);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : defaultSettings.keepRecent;
 }
 
 function getQueryTopK() {
@@ -836,6 +863,98 @@ function buildForceEntry(a) {
     return a.raw ? { ...a.raw, world: a.world, uid: a.uid } : { world: a.world, uid: a.uid };
 }
 
+/**
+ * 🎲 랜덤 주입 후보 뽑기 (v0.15.0).
+ *
+ * 발주 의도: 장면 유사성이 있는 부분에서만 나와서 의외의 내용이 영영 안 나오는 걸 막는 장치.
+ * 그래서 **벡터 검색도 Jev 판정도 거치지 않는다** — 색인이 안 된 로어북도 후보에 들어간다.
+ *
+ * 제외: constant(코어 — ST가 매턴 네이티브 주입) / disable / 본문 빈 것 /
+ *       이번 턴 Jev 채택분(excludeKeys — 중복 주입 방지) / 쿨다운 중인 uid.
+ * 예산은 randomBudgetTokens 단독이라 Jev 채택분의 예산 컷에 일절 영향을 주지 않는다.
+ * 한 항목이 남은 예산을 넘으면 건너뛰고 다음 후보를 본다(자투리 활용 — Jev 컷과 같은 규칙).
+ * 담을 게 없으면 0개로 조용히 끝낸다. 토스트는 띄우지 않는다.
+ *
+ * @param {string[]} worlds 대상 로어북 이름 (getTargetWorlds — 4계층 전부)
+ * @param {Set<string>} excludeKeys 제외할 `${world}.${uid}`
+ * @returns {Promise<Array>} 뽑힌 항목
+ */
+async function pickRandomEntries(worlds, excludeKeys) {
+    if (getSettings().randomEnabled !== true) return [];
+    const budget = getRandomBudget();
+    if (budget <= 0) return [];
+
+    const pool = [];
+    for (const world of worlds) {
+        let worldData;
+        try {
+            worldData = await loadWorldInfo(world);
+        } catch (error) {
+            console.log(`${LOG} 🎲 '${world}' 읽기 실패 — 이 로어북만 건너뜀: ${error?.message ?? error}`);
+            continue;
+        }
+        for (const entry of Object.values(worldData?.entries ?? {})) {
+            if (!entry || entry.disable || entry.constant) continue;
+            const text = String(entry.content ?? '').trim();
+            if (!text) continue;
+            const key = `${world}.${entry.uid}`;
+            if (excludeKeys.has(key)) continue;
+            pool.push({ world, uid: entry.uid, key, text, title: String(entry.comment || `uid ${entry.uid}`), raw: entry });
+        }
+    }
+    if (!pool.length) return [];
+
+    // 쿨다운 — 링버퍼 크기는 풀 크기에 비례. 쿨다운 때문에 후보가 0이 되면 무시하고 다시 뽑는다(항목 적은 로어북 보호).
+    const cooldownSize = Math.max(5, Math.floor(pool.length / 3));
+    const cooled = new Set(recentRandomUids);
+    let avail = pool.filter(p => !cooled.has(p.key));
+    const cooledOut = pool.length - avail.length;
+    let cooldownIgnored = false;
+    if (!avail.length) {
+        avail = pool.slice();
+        cooldownIgnored = true;
+    }
+
+    // Fisher-Yates 셔플
+    for (let i = avail.length - 1; i > 0; i--) {
+        const k = Math.floor(Math.random() * (i + 1));
+        [avail[i], avail[k]] = [avail[k], avail[i]];
+    }
+
+    const picked = [];
+    let used = 0;
+    for (const cand of avail) {
+        if (used >= budget) break;
+        const tokens = await getTokenCountAsync(cand.text);
+        if (used + tokens > budget) continue; // 남은 예산에 드는 다음 후보 탐색
+        used += tokens;
+        picked.push({ ...cand, tokens });
+    }
+    if (!picked.length) {
+        console.log(`${LOG} 🎲 랜덤 0건 — 풀 ${pool.length}개 / 쿨다운 제외 ${cooledOut}개 / 예산 ${budget}토큰에 드는 항목 없음`);
+        return [];
+    }
+
+    recentRandomUids.push(...picked.map(p => p.key));
+    if (recentRandomUids.length > cooldownSize) recentRandomUids = recentRandomUids.slice(-cooldownSize);
+
+    console.log(`${LOG} 🎲 랜덤 ${picked.length}건 · ${used}/${budget}토큰 · 풀 ${pool.length}개 · 쿨다운 제외 ${cooledOut}개${cooldownIgnored ? '(무시함)' : ''} · 링버퍼 ${recentRandomUids.length}/${cooldownSize} · [${picked.map(p => `${p.world}#${p.uid}`).join(', ')}]`);
+    return picked;
+}
+
+/** 이번 턴 랜덤 선택을 기억한다 — 캐시 히트 재주입과 패널 🎲 분류가 같은 출처를 봐야 한다 */
+function rememberRandomPicks(picks) {
+    lastRandomItems = picks.map(p => ({ world: p.world, uid: p.uid, raw: p.raw }));
+    lastRandomKeys = new Set(picks.map(p => `${p.world}.${p.uid}`));
+}
+
+/** 채팅이 바뀌면 쿨다운·직전 선택을 비운다 — 다른 채팅의 이력이 남으면 새 채팅 첫 턴이 편향된다 */
+function resetRandomCooldown() {
+    recentRandomUids = [];
+    lastRandomItems = [];
+    lastRandomKeys = new Set();
+}
+
 // ── generate_interceptor ────────────────────────────────────────────────
 
 async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
@@ -869,11 +988,16 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         // 단 FORCE_ACTIVATE는 스캔 1회용이라 주입은 매번 다시 쏜다.
         const cacheKey = getStringHash(worlds.join('|') + '\u0000' + queryText);
         if (cacheKey === lastJudgment.key && (Date.now() - lastJudgment.ts) < JUDGMENT_CACHE_MS) {
-            if (lastJudgment.items.length) {
+            // 🎲 캐시 히트 턴에는 새로 뽑지 않는다 — 같은 턴의 연쇄 quiet 생성에서 주입물이 흔들리면 안 된다 (v0.15.0)
+            const cachedItems = [...lastJudgment.items, ...lastRandomItems];
+            if (cachedItems.length) {
                 await eventSource.emit(
                     event_types.WORLDINFO_FORCE_ACTIVATE,
-                    lastJudgment.items.map(buildForceEntry),
+                    cachedItems.map(buildForceEntry),
                 );
+            }
+            if (lastRandomItems.length) {
+                console.log(`${LOG} 🎲 랜덤 ${lastRandomItems.length}건 재주입 (캐시 히트 — 새로 뽑지 않음)`);
             }
             if (lastReport) {
                 lastReport.cacheHits = (lastReport.cacheHits || 0) + 1;
@@ -908,6 +1032,15 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         }
 
         if (!candidates.length) {
+            // 🎲 랜덤은 검색·판정과 무관하다 — 색인이 없어 회수가 통째로 실패해도 여기서 발사한다 (v0.15.0)
+            const randomOnly = await pickRandomEntries(worlds, new Set());
+            rememberRandomPicks(randomOnly);
+            if (randomOnly.length) {
+                await eventSource.emit(
+                    event_types.WORLDINFO_FORCE_ACTIVATE,
+                    randomOnly.map(buildForceEntry),
+                );
+            }
             console.log(`${LOG} 후보 0건 — 대상(${worlds.join(', ')})이 색인돼 있는지 확인해라 ([색인] 버튼)`);
             return;
         }
@@ -940,10 +1073,15 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         lastJudgment = { key: cacheKey, items: adopted.map(a => ({ world: a.world, uid: a.uid, raw: a.raw })), ts: Date.now() };
 
         // 4. 주입
-        if (adopted.length) {
+        // 🎲 랜덤은 별도 예산이라 위 컷 결과를 바꾸지 않는다. 이번 턴 채택분은 후보에서 빼고(중복 주입 방지)
+        //    같은 배열에 합쳐 한 번에 emit한다 — 주입 경로는 buildForceEntry 하나로 통일 (v0.15.0)
+        const randomPicks = await pickRandomEntries(worlds, new Set(adopted.map(a => `${a.world}.${a.uid}`)));
+        rememberRandomPicks(randomPicks);
+        const forceEntries = [...adopted, ...randomPicks].map(buildForceEntry);
+        if (forceEntries.length) {
             await eventSource.emit(
                 event_types.WORLDINFO_FORCE_ACTIVATE,
-                adopted.map(buildForceEntry),
+                forceEntries,
             );
         }
 
@@ -2671,16 +2809,19 @@ function renderPanelInjected($panel) {
     // 채택 여부·최종점수·판정 시점 본문은 전부 lastReport에서 온다.
     // lastReport가 없으면(첫 로드/판정 실패) 점수 칸과 탈락 블록만 빠지고 표는 그대로 그린다.
     const reportRows = new Map((lastReport?.rows ?? []).map(r => [`${r.world}.${r.uid}`, r]));
-    const KIND_BADGE = { core: '⭐ 코어', jev: '🧠 Jev', keyword: '🔑 키워드' };
+    const KIND_BADGE = { core: '⭐ 코어', jev: '🧠 Jev', random: '🎲 랜덤', keyword: '🔑 키워드' };
+    // 🎲는 판정을 안 거쳤으니 점수 칸이 '—'다 (⭐·🔑과 같은 이유). 순서는 ⭐ → 🧠 → 🎲 → 🔑(나머지).
     const classify = (e) => (e.constant === true)
         ? 'core'
-        : (reportRows.get(`${e.world}.${e.uid}`)?.adopted ? 'jev' : 'keyword');
+        : (reportRows.get(`${e.world}.${e.uid}`)?.adopted
+            ? 'jev'
+            : (lastRandomKeys.has(`${e.world}.${e.uid}`) ? 'random' : 'keyword'));
 
     const rows = lastActivated.entries.map(e => ({ entry: e, kind: classify(e) }));
-    const counts = { core: 0, jev: 0, keyword: 0 };
+    const counts = { core: 0, jev: 0, random: 0, keyword: 0 };
     for (const r of rows) counts[r.kind]++;
     // 토큰은 비동기라 제목줄은 개수부터 띄우고 뒤에서 채운다 (fillStackTokens 선례, v0.6.3)
-    $title.text(`${INJECTED_TITLE} — ⭐${counts.core} / 🧠${counts.jev} / 🔑${counts.keyword} · 집계 중…`);
+    $title.text(`${INJECTED_TITLE} — ⭐${counts.core} / 🧠${counts.jev} / 🎲${counts.random} / 🔑${counts.keyword} · 집계 중…`);
 
     $box.append($('<div class="jev-panel-muted">').text(
         `${new Date(lastActivated.ts).toLocaleTimeString()} 생성 · 총 ${rows.length}개`));
@@ -2706,13 +2847,13 @@ function renderPanelInjected($panel) {
     const $tokenCells = [];
     const ordered = [];
     for (const [world, groupRows] of groups) {
-        const gc = { core: 0, jev: 0, keyword: 0 };
+        const gc = { core: 0, jev: 0, random: 0, keyword: 0 };
         for (const r of groupRows) gc[r.kind]++;
         const $groupCell = $('<td>').attr('colspan', headers.length);
         const layer = layerOf.get(world);
         if (layer) $groupCell.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
         $groupCell.append($('<span class="jev-group-name">').text(world || '(이름 없음)'));
-        $groupCell.append($('<span class="jev-group-meta">').text(`⭐${gc.core} · 🧠${gc.jev} · 🔑${gc.keyword}`));
+        $groupCell.append($('<span class="jev-group-meta">').text(`⭐${gc.core} · 🧠${gc.jev} · 🎲${gc.random} · 🔑${gc.keyword}`));
         $tbody.append($('<tr class="jev-panel-group-row">').append($groupCell));
 
         for (const r of groupRows) {
@@ -2771,8 +2912,8 @@ function renderPanelInjected($panel) {
 /** 주입 표의 토큰을 뒤에서 채운다 — getTokenCountAsync가 비동기라 패널 렌더를 막지 않는다 */
 async function fillInjectedTokens($title, $cells, rows) {
     try {
-        const counts = { core: 0, jev: 0, keyword: 0 };
-        const totals = { core: 0, jev: 0, keyword: 0 };
+        const counts = { core: 0, jev: 0, random: 0, keyword: 0 };
+        const totals = { core: 0, jev: 0, random: 0, keyword: 0 };
         const tokens = await Promise.all(rows.map(r => {
             const text = String(r.entry.content ?? '');
             return text ? getTokenCountAsync(text) : Promise.resolve(0);
@@ -2782,10 +2923,11 @@ async function fillInjectedTokens($title, $cells, rows) {
             totals[rows[i].kind] += tokens[i];
             $cells[i].text(tokens[i].toLocaleString());
         }
-        const sum = totals.core + totals.jev + totals.keyword;
+        const sum = totals.core + totals.jev + totals.random + totals.keyword;
         $title.text(`${INJECTED_TITLE} — `
             + `⭐${counts.core}·${totals.core.toLocaleString()}tok / `
             + `🧠${counts.jev}·${totals.jev.toLocaleString()}tok / `
+            + `🎲${counts.random}·${totals.random.toLocaleString()}tok / `
             + `🔑${counts.keyword}·${totals.keyword.toLocaleString()}tok`
             + ` · 합계 ${sum.toLocaleString()}tok`);
     } catch (error) {
@@ -2905,6 +3047,23 @@ async function openDetailPanel() {
     });
 
     $panel.find('#jev_panel_refresh').on('click', () => refreshPanel($panel));
+
+    // 남겨둘 최근 챗 수 (v0.15.0) — 설정탭 #jev_lorebook_keep_recent와 **같은 값**이다(창구가 둘).
+    // 1회용 값이 아니라 settings.keepRecent를 직접 쓰고, 바꾸면 막대·판정문을 다시 그려 미리보기가 된다.
+    const $keepRecent = $panel.find('#jev_panel_keep_recent').val(getKeepRecent());
+    let keepRecentTimer = null;
+    $keepRecent.on('input', function () {
+        const raw = String($(this).val()).trim();
+        const value = Number(raw);
+        // 빈 값·비숫자·음수는 무시하고 직전 값을 유지한다 — 지우고 다시 치는 중일 수 있다
+        if (!raw || !Number.isFinite(value) || value < 0) return;
+        const settings = getSettings();
+        settings.keepRecent = Math.floor(value);
+        saveSettingsDebounced();
+        $('#jev_lorebook_keep_recent').val(settings.keepRecent); // 설정탭이 열려 있을 수 있다
+        clearTimeout(keepRecentTimer);
+        keepRecentTimer = setTimeout(() => renderPanelSummary($panel), 250); // 연타 시 렌더가 겹치지 않게
+    });
 
     refreshPanel($panel); // 비동기 — 팝업은 즉시 뜨고 색인 대조가 따라 채워진다
     await callGenericPopup($panel, POPUP_TYPE.TEXT, '', {
@@ -3158,6 +3317,17 @@ jQuery(async () => {
         saveSettingsDebounced();
     });
 
+    // 🎲 랜덤 주입 (v0.15.0) — 예산은 위 주입 예산과 별개 통이다
+    $('#jev_lorebook_random_enabled').prop('checked', settings.randomEnabled === true).on('change', function () {
+        settings.randomEnabled = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#jev_lorebook_random_budget').val(getRandomBudget()).on('input', function () {
+        settings.randomBudgetTokens = clampSetting($(this).val(), RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
+        saveSettingsDebounced();
+    });
+
     $('#jev_lorebook_world').on('change', function () {
         settings.world = String($(this).val());
         saveSettingsDebounced();
@@ -3280,7 +3450,10 @@ jQuery(async () => {
     // 본문 날짜 헤더 자동 마이그레이션 (v0.12.0) — 채팅이 바뀔 때마다 대상 로어북을 보고 아직 안 한 것만 처리.
     // 확장 로드 시점엔 이미 채팅이 열려 있을 수 있어 CHAT_CHANGED가 안 온다 → 여기서 1회 직접 돌린다.
     if (event_types.CHAT_CHANGED) {
-        eventSource.on(event_types.CHAT_CHANGED, () => { void runHeaderMigration(); });
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            void runHeaderMigration();
+            resetRandomCooldown(); // 🎲 채팅이 바뀌면 쿨다운 링버퍼를 비운다 (v0.15.0)
+        });
     } else {
         console.warn(`${LOG} event_types.CHAT_CHANGED가 없다 — 헤더 마이그레이션은 로드 시 1회만 돌아간다`);
     }

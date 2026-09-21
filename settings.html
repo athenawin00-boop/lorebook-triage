@@ -5,6 +5,7 @@
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
+            <div class="jev-set-body">
 
             <div class="jev-set-group">기본</div>
 
@@ -21,6 +22,15 @@
             <label for="jev_lorebook_budget">턴당 주입 예산</label>
             <input id="jev_lorebook_budget" class="text_pole" type="number" min="500" max="20000" step="100" />
             <small class="jev-set-help">매 턴 기억에 쓸 최대 토큰. (기본 4,000)</small>
+
+            <label class="checkbox_label" for="jev_lorebook_random_enabled">
+                <input id="jev_lorebook_random_enabled" type="checkbox" />
+                <span>🎲 랜덤 주입</span>
+            </label>
+
+            <label for="jev_lorebook_random_budget">랜덤 주입 예산</label>
+            <input id="jev_lorebook_random_budget" class="text_pole" type="number" min="0" max="20000" step="50" />
+            <small class="jev-set-help">검색과 무관하게 무작위로 골라 넣어요. 방금 뽑힌 항목은 한동안 다시 나오지 않아요.</small>
 
             <div class="jev-set-group">검색</div>
 
@@ -127,6 +137,7 @@
             <small class="jev-set-help">첫 설치 시 로어북을 연결한 뒤 눌러 주세요.</small>
 
             <small id="jev_lorebook_status" class="jev-lorebook-status"></small>
+            </div>
         </div>
     </div>
 </div>
