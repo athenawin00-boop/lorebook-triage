@@ -324,6 +324,12 @@ const defaultSettings = Object.freeze({
     // ⚠ 저장 키가 로어북 '이름'이라 ST에서 이름을 바꾸면 이 레코드는 고아가 된다. 정리 로직은 두지 않기로 확정했다
     //   (발주자 결정: 방치). 고아 레코드는 어느 북에도 매칭되지 않아 동작에 영향이 없다.
     perWorld: {},
+    // ── v0.18.0 신규 ──
+    // 계층별 파라미터 오버라이드. 레코드 키는 perWorld와 같은 넷(PER_WORLD_KEYS를 그대로 쓴다).
+    // 값이 없거나 빈 문자열이면 전역값을 상속한다. 우선순위는 북별(perWorld) > 계층(perLayer) > 전역.
+    // ⚠ 계층 키는 getTargetWorldsDetailed()가 내는 layer 값과 같아야 한다 — 'character'다(사양서 표기 'char' 아님).
+    //   'fixed'(설정 고정 대상)는 계층 레코드를 두지 않는다 → 북별이 없으면 전역값으로 간다.
+    perLayer: { chat: {}, persona: {}, character: {}, global: {} },
 });
 
 /** 설정 숫자 방어 — 설정 파일이 손으로 망가졌어도 파이프라인은 돌아가야 한다 */
@@ -390,23 +396,101 @@ function hasWorldOverride(world) {
     return !!rec && PER_WORLD_KEYS.some(key => resolveOverride(rec[key]) !== undefined);
 }
 
-/** 주입 예산 — 북별 오버라이드 우선, 없으면 전역값 */
-function getBudgetTokens(world) {
-    const override = resolveOverride(getWorldOverride(world)?.budgetTokens);
+// ── 계층별 파라미터 오버라이드 (v0.18.0) ─────────────────────────────
+// v0.17.0의 오버라이드는 로어북 '이름' 단위였다. 발주 요구가 바뀌어(2026-09-22) 랜덤 주입 같은 값을
+// '어느 계층에 걸지'로 정해야 한다 → 계층(채팅·페르소나·캐릭터·전역) 레코드를 넣고,
+// 북별은 지우지 않고 예외 층으로 남긴다. 우선순위: 북별 > 계층 > 전역. 네 게터 전부 같은 규칙이다.
+const LAYER_ORDER = Object.freeze(['chat', 'persona', 'character', 'global']);
+
+/**
+ * 계층 오버라이드 저장소. getPerWorldStore()의 '공유 객체 끊기'를 **두 겹**으로 한다.
+ * ⚠ getSettings()의 결손 키 보충은 defaultSettings.perLayer를 참조로 물려준다(Object.freeze는 얕다).
+ *   바깥 객체만 갈면 네 계층 레코드가 여전히 defaultSettings 쪽 같은 객체를 가리켜,
+ *   업그레이드 설치에서 채팅 계층에 넣은 값이 다른 계층에도 그대로 보인다.
+ */
+function getPerLayerStore() {
+    const settings = getSettings();
+    const store = settings.perLayer;
+    const usable = store && typeof store === 'object' && !Array.isArray(store);
+    if (!usable || store === defaultSettings.perLayer) {
+        settings.perLayer = usable ? { ...store } : {};
+    }
+    for (const layer of LAYER_ORDER) {
+        const rec = settings.perLayer[layer];
+        const recUsable = rec && typeof rec === 'object' && !Array.isArray(rec);
+        if (!recUsable || rec === defaultSettings.perLayer?.[layer]) {
+            settings.perLayer[layer] = recUsable ? { ...rec } : {};
+        }
+    }
+    return settings.perLayer;
+}
+
+/** 이 계층의 오버라이드 레코드 — 없거나 형식이 깨졌으면 null */
+function getLayerOverride(layer) {
+    if (!layer) return null;
+    const rec = getPerLayerStore()[layer];
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return null;
+    return rec;
+}
+
+/** 이 계층에 지정된 값이 하나라도 있나 — 감지 목록의 '계층 설정 따름' 표기 판정 */
+function hasLayerOverride(layer) {
+    const rec = getLayerOverride(layer);
+    return !!rec && PER_WORLD_KEYS.some(key => resolveOverride(rec[key]) !== undefined);
+}
+
+/**
+ * 로어북 → 계층 조회 캐시.
+ * getTargetWorldsDetailed()는 4계층 전수 스캔(카드 charLore 조회 포함)이라 게터가 매 호출 부르면 비싸다
+ * — 주입 파이프라인은 한 턴에 '북 수 × 게터 수'만큼 부른다.
+ * ⚠ 무효화 지점은 이 다섯뿐이다: ① CHAT_CHANGED ② WORLDINFO_UPDATED ③ 감지 층 체크박스 변경
+ *    ④ 고정 대상(settings.world) 변경 ⑤ 인터셉터 진입(턴 시작). 그 밖에서는 캐시를 믿는다.
+ * 이미 detailed 목록을 쥔 호출부는 게터에 layer를 직접 넘겨 이 조회 자체를 건너뛴다.
+ */
+let worldLayerCache = null;
+
+function invalidateWorldLayerCache() {
+    worldLayerCache = null;
+}
+
+/** 이 로어북이 귀속된 계층. 귀속 순서(채팅 > 페르소나 > 캐릭터 > 전역)는 getTargetWorldsDetailed()가 정한다 */
+function getWorldLayer(world) {
+    if (!world) return null;
+    if (!worldLayerCache) {
+        worldLayerCache = new Map(getTargetWorldsDetailed().map(d => [d.name, d.layer]));
+    }
+    return worldLayerCache.get(world) ?? null;
+}
+
+/**
+ * 값 하나를 북별 > 계층 > 전역 순으로 해석한다. undefined 반환 = 전역값을 쓰라는 뜻.
+ * layer를 넘기면 계층 조회를 건너뛴다. world만 넘기면 캐시로 계층을 찾는다.
+ * `0`과 `false`는 사용자가 고른 정당한 값이라 resolveOverride()가 '미설정'과 갈라 준다.
+ */
+function resolveLayered(key, world, layer) {
+    const own = resolveOverride(getWorldOverride(world)?.[key]);
+    if (own !== undefined) return own;
+    const target = layer !== undefined ? layer : getWorldLayer(world);
+    return resolveOverride(getLayerOverride(target)?.[key]);
+}
+
+/** 주입 예산 — 북별 > 계층 > 전역 순으로 해석한다 (v0.18.0) */
+function getBudgetTokens(world, layer) {
+    const override = resolveLayered('budgetTokens', world, layer);
     const raw = override !== undefined ? override : getSettings().budgetTokens;
     return clampSetting(raw, BUDGET_TOKENS_MIN, BUDGET_TOKENS_MAX, defaultSettings.budgetTokens);
 }
 
-/** 랜덤 주입 예산 — 북별 오버라이드 우선, 없으면 전역값 */
-function getRandomBudget(world) {
-    const override = resolveOverride(getWorldOverride(world)?.randomBudgetTokens);
+/** 랜덤 주입 예산 — 북별 > 계층 > 전역 (v0.18.0) */
+function getRandomBudget(world, layer) {
+    const override = resolveLayered('randomBudgetTokens', world, layer);
     const raw = override !== undefined ? override : getSettings().randomBudgetTokens;
     return clampSetting(raw, RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
 }
 
-/** 랜덤 주입 켜짐 여부 — 북별 오버라이드 우선. 체크박스라 '미설정'과 false를 반드시 갈라야 한다 */
-function isRandomEnabled(world) {
-    const override = resolveOverride(getWorldOverride(world)?.randomEnabled);
+/** 랜덤 주입 켜짐 여부 — 북별 > 계층 > 전역. 체크박스가 아니라 select인 이유: '미설정'을 표현해야 한다 (v0.18.0) */
+function isRandomEnabled(world, layer) {
+    const override = resolveLayered('randomEnabled', world, layer);
     if (override !== undefined) return override === true;
     return getSettings().randomEnabled === true;
 }
@@ -417,9 +501,9 @@ function getKeepRecent() {
     return Number.isFinite(value) && value >= 0 ? Math.floor(value) : defaultSettings.keepRecent;
 }
 
-/** 회수 후보 수(topK) — 북별 오버라이드 우선, 없으면 전역값. 회수는 원래부터 북별 쿼리라 그대로 먹는다 */
-function getQueryTopK(world) {
-    const override = resolveOverride(getWorldOverride(world)?.queryTopK);
+/** 회수 후보 수(topK) — 북별 > 계층 > 전역 (v0.18.0) */
+function getQueryTopK(world, layer) {
+    const override = resolveLayered('queryTopK', world, layer);
     const raw = override !== undefined ? override : getSettings().queryTopK;
     return clampSetting(raw, TOP_K_MIN, TOP_K_MAX, DEFAULT_TOP_K);
 }
@@ -1115,12 +1199,13 @@ function randomCooldownSize(poolSize) {
  * @param {string[]} worlds 대상 로어북 이름 (getTargetWorlds — 4계층 전부)
  * @param {Set<string>} excludeKeys 제외할 `${world}.${uid}`
  * @returns {Promise<Array>} 북별 결과를 합친 것
+ * @param {Map<string,string>|null} [layerOf] 북 → 계층 표. 없으면 게터가 캐시로 조회한다 (v0.18.0)
  */
-async function pickRandomEntries(worlds, excludeKeys) {
+async function pickRandomEntries(worlds, excludeKeys, layerOf = null) {
     const picked = [];
     for (const world of worlds) {
-        if (!isRandomEnabled(world)) continue; // 북별 켜기 — 전역이 켜져 있어도 이 북만 끌 수 있다
-        const budget = getRandomBudget(world);
+        if (!isRandomEnabled(world, layerOf?.get(world))) continue; // 북별 켜기 — 전역이 켜져 있어도 이 북만 끌 수 있다
+        const budget = getRandomBudget(world, layerOf?.get(world));
         if (budget <= 0) continue;
 
         let worldData;
@@ -1219,7 +1304,11 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         }
 
         // 대상 로어북: 켜진 층에서 감지된 것 전부 (v0.8.0 — ST 본체와 같은 4계층)
-        const worlds = getTargetWorlds();
+        invalidateWorldLayerCache(); // 캐시 무효화 지점 ⑤ — 턴 시작. 채팅·카드·전역 구성이 바뀌었을 수 있다
+        const detailed = getTargetWorldsDetailed();
+        const worlds = detailed.map(d => d.name);
+        // 이 턴에 쓸 북 → 계층 표. 게터에 직접 넘겨 계층 조회를 건너뛴다(한 턴에 '북 수 × 게터 수'만큼 부른다).
+        const layerOf = new Map(detailed.map(d => [d.name, d.layer]));
         if (!worlds.length) {
             console.log(`${LOG} 켜진 층에서 감지된 로어북 없음 — 건너뜀 (특정 로어북을 강제하려면 설정의 고정 대상)`);
             return;
@@ -1252,7 +1341,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         for (const world of worlds) {
             let metadata;
             try {
-                ({ metadata } = await vectorQuery(world, queryText, getQueryTopK(world)));
+                ({ metadata } = await vectorQuery(world, queryText, getQueryTopK(world, layerOf.get(world))));
             } catch (error) {
                 console.log(`${LOG} '${world}' 회수 실패(색인 안 됨?) — 이 로어북만 건너뜀: ${error?.message ?? error}`);
                 continue;
@@ -1274,7 +1363,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
 
         if (!candidates.length) {
             // 🎲 랜덤은 검색·판정과 무관하다 — 색인이 없어 회수가 통째로 실패해도 여기서 발사한다 (v0.15.0)
-            const randomOnly = await pickRandomEntries(worlds, new Set());
+            const randomOnly = await pickRandomEntries(worlds, new Set(), layerOf);
             rememberRandomPicks(randomOnly);
             if (randomOnly.length) {
                 await eventSource.emit(
@@ -1305,7 +1394,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         const budgetByWorld = new Map();
         let usedTokens = 0;
         for (const world of worlds) {
-            const budget = getBudgetTokens(world);
+            const budget = getBudgetTokens(world, layerOf.get(world));
             budgetByWorld.set(world, budget);
             const worldRanked = judged.filter(j => j.world === world).sort((a, b) => b.final - a.final);
             let used = 0;
@@ -1330,7 +1419,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         // 4. 주입
         // 🎲 랜덤은 별도 예산이라 위 컷 결과를 바꾸지 않는다. 이번 턴 채택분은 후보에서 빼고(중복 주입 방지)
         //    같은 배열에 합쳐 한 번에 emit한다 — 주입 경로는 buildForceEntry 하나로 통일 (v0.15.0)
-        const randomPicks = await pickRandomEntries(worlds, new Set(adopted.map(a => `${a.world}.${a.uid}`)));
+        const randomPicks = await pickRandomEntries(worlds, new Set(adopted.map(a => `${a.world}.${a.uid}`)), layerOf);
         rememberRandomPicks(randomPicks);
         const forceEntries = [...adopted, ...randomPicks].map(buildForceEntry);
         if (forceEntries.length) {
@@ -3023,7 +3112,7 @@ async function renderPanelChunks($panel) {
             const coreOffCount = coreEntries.length - coreLive.length;
             const coreTokens = coreLive.reduce((sum, e) => sum + approxTokens(e.content), 0);
             const liveOtherCount = coreOther.filter(e => !e.disable).length;
-            const budget = getBudgetTokens(world); // 북별 유효 예산 (오버라이드 반영)
+            const budget = getBudgetTokens(world, layer); // 북별 유효 예산 (오버라이드 반영)
             const $core = $('<div class="jev-panel-core">');
             $core.append($('<div class="jev-panel-core-title">').text(
                 `⭐ 코어 ${coreLive.length}개 (규칙 ${coreRules.filter(e => !e.disable).length} · 일기 ${coreDiaries.filter(e => !e.disable).length}${liveOtherCount ? ` · 기타 ${liveOtherCount}` : ''})`
@@ -3557,8 +3646,11 @@ async function renderLayerList($root = $(document)) {
         $row.append($('<span class="jev-layer-name">').text(name));
         if (hasWorldOverride(name)) {
             $row.append($('<span class="jev-layer-badge jev-override-badge">').text('설정 있음'));
+        } else if (hasLayerOverride(layer)) {
+            // 북별 값이 없을 때만 계층을 말한다 — 둘 다 띄우면 어느 게 이기는지 화면이 설명하지 못한다
+            $row.append($('<span class="jev-layer-badge">').text('계층 설정 따름'));
         }
-        const openWorld = () => void openWorldSettingsPopup(name);
+        const openWorld = () => void openOverrideSettingsPopup('world', name);
         $row.append($('<span class="jev-layer-gear" role="button" tabindex="0">')
             .attr('title', '이 로어북만의 주입 예산·랜덤·회수 후보 수를 정해요')
             .append($('<i class="fa-solid fa-gear">'))
@@ -3590,7 +3682,7 @@ async function renderLayerList($root = $(document)) {
                 indexText = `색인 확인 실패 (${error?.message ?? error})`;
             }
             // 랜덤이 꺼진 북에 후보·쿨다운 숫자를 띄우면 "뽑히는 중"으로 읽힌다 → 꺼짐을 먼저 말한다
-            const randomText = isRandomEnabled(name)
+            const randomText = isRandomEnabled(name, layer)
                 ? `랜덤 후보 ${indexTargets.length}개 · 쿨다운 ${randomCooldownSize(indexTargets.length)}`
                 : '랜덤 꺼짐';
             $meta.text(`${live.length}항목 · ${indexText} · ${randomText}`);
@@ -3674,13 +3766,14 @@ async function renderBudgetTotal($root = $(document)) {
     const run = ++budgetTotalRun;
     const $line = $root.find('#jev_lorebook_budget_total');
     if (!$line.length) return;
-    const worlds = getTargetWorlds();
+    const detailed = getTargetWorldsDetailed();
+    const worlds = detailed.map(d => d.name);
     if (!worlds.length) {
         $line.text('감지된 로어북이 없어서 합계를 낼 수 없어요.');
         return;
     }
-    const searchBudget = worlds.reduce((sum, w) => sum + getBudgetTokens(w), 0);
-    const randomBudget = worlds.reduce((sum, w) => sum + (isRandomEnabled(w) ? getRandomBudget(w) : 0), 0);
+    const searchBudget = detailed.reduce((sum, d) => sum + getBudgetTokens(d.name, d.layer), 0);
+    const randomBudget = detailed.reduce((sum, d) => sum + (isRandomEnabled(d.name, d.layer) ? getRandomBudget(d.name, d.layer) : 0), 0);
     const tail = `검색 ${searchBudget.toLocaleString()} + 랜덤 ${randomBudget.toLocaleString()}`;
     $line.text(`이 채팅 · 코어 집계 중… + ${tail}`);
 
@@ -3705,54 +3798,120 @@ async function renderBudgetTotal($root = $(document)) {
 }
 
 /**
- * 로어북 하나짜리 설정 팝업 (v0.17.0 — 요구 H).
+ * 계층별 설정 4행 (v0.18.0 — 팝업 A).
  *
- * 네 칸 모두 '비우면 전역값 상속'이다. 랜덤 켜기만 select인 이유: 체크박스로는 '미설정'을 표현할 수 없다
- * — 그 북만 끄는 것(false)과 전역을 따르는 것(미설정)은 다른 상태다.
+ * 행 순서는 채팅 > 페르소나 > 캐릭터 > 전역으로 고정한다(LAYER_ORDER) — getTargetWorldsDetailed()의
+ * 귀속 순서와 같아야 사용자가 "위에 있는 층이 먼저 먹는다"를 한 번만 배우면 된다.
+ * 행마다 유효값 한 줄 + 톱니뿐이다. 설명은 섹션에 한 줄만 둔다(행마다 달면 같은 말이 네 번 나온다).
+ * 동기 렌더 — 로어북을 읽지 않고 설정값만 쓴다(감지 목록과 달리 비동기가 필요 없다).
+ *
+ * @param {*} [$root] 검색 기준. 팝업을 열 때는 아직 DOM에 안 붙은 $popup을 넘긴다.
+ */
+function renderLayerOverrides($root = $(document)) {
+    const $box = $root.find('#jev_lorebook_layer_overrides');
+    if (!$box.length) return;
+    $box.empty();
+    for (const layer of LAYER_ORDER) {
+        const $row = $('<div class="jev-layer-row">');
+        $row.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
+        // world 없이 layer만 넘긴다 — 북별 예외를 섞지 않은 '이 계층의 유효값'이어야 한다
+        const randomText = isRandomEnabled(undefined, layer)
+            ? `랜덤 켜짐 ${getRandomBudget(undefined, layer).toLocaleString()}`
+            : '랜덤 꺼짐';
+        const rec = getLayerOverride(layer);
+        const setCount = PER_WORLD_KEYS.filter(key => resolveOverride(rec?.[key]) !== undefined).length;
+        $row.append($('<span class="jev-layer-effective">').text(
+            `주입 ${getBudgetTokens(undefined, layer).toLocaleString()}`
+            + ` · ${randomText}`
+            + ` · 회수 ${getQueryTopK(undefined, layer)}`
+            + ` — ${setCount ? `이 계층에서 ${setCount}개 정했어요` : '전부 전역값을 상속해요'}`));
+        const openLayer = () => void openOverrideSettingsPopup('layer', layer);
+        $row.append($('<span class="jev-layer-gear" role="button" tabindex="0">')
+            .attr('title', '이 계층에 속한 로어북의 주입 예산·랜덤·회수 후보 수를 정해요')
+            .append($('<i class="fa-solid fa-gear">'))
+            .on('click', openLayer)
+            .on('keydown', (ev) => {
+                if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openLayer(); }
+            }));
+        $box.append($row);
+    }
+}
+
+/**
+ * 오버라이드 설정 팝업 — 로어북 하나(v0.17.0) / 계층 하나(v0.18.0) 겸용.
+ *
+ * 입력칸 구성이 같으므로 popup-world.html 템플릿 **하나**를 두 모드가 함께 쓴다.
+ * 템플릿을 복제하면 다음 수정에서 한쪽만 고쳐진다 — 달라지는 건 제목·설명·되돌리기 문구·상속 대상뿐이라
+ * 모드 인자로 갈랐다.
+ *
+ * 네 칸 모두 '비우면 상속'이다. 랜덤 켜기만 select인 이유: 체크박스로는 '미설정'을 표현할 수 없다
+ * — 그 층만 끄는 것(false)과 상위값을 따르는 것(미설정)은 다른 상태다.
  * 저장은 입력 즉시(saveSettingsDebounced). 값이 비면 키를 지우고, 레코드가 비면 레코드째 지운다
  * — 빈 레코드를 남기면 '설정 있음' 배지가 거짓말한다.
+ *
+ * ⚠ 되돌리기 문구가 모드별로 다른 이유: 북별을 지우면 **계층**값으로 내려가고(전역이 아니다),
+ *   계층을 지우면 전역값으로 내려간다. 우선순위가 3단이 된 v0.18.0부터 "전역값으로 되돌리기"는
+ *   북별 모드에서 거짓말이 된다.
+ *
+ * @param {'world'|'layer'} mode 오버라이드 단위
+ * @param {string} key 로어북 이름(world 모드) 또는 계층 키(layer 모드)
  */
-async function openWorldSettingsPopup(world) {
+async function openOverrideSettingsPopup(mode, key) {
+    const isLayer = mode === 'layer';
     const html = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'popup-world');
     const $popup = $(html);
-    const store = getPerWorldStore();
+    const store = isLayer ? getPerLayerStore() : getPerWorldStore();
     const rec = () => {
-        const r = store[world];
+        const r = store[key];
         return (r && typeof r === 'object' && !Array.isArray(r)) ? r : null;
     };
+    // 게터 인자쌍 — 계층 모드에서는 world를 비우고 layer만 넘긴다
+    const argWorld = isLayer ? undefined : key;
+    const argLayer = isLayer ? key : undefined;
+    // 이 레코드를 비웠을 때 내려갈 값 — 북별은 자기 계층으로, 계층은 전역으로
+    const inhLayer = isLayer ? undefined : getWorldLayer(key);
 
-    $popup.find('#jev_world_title').text(world);
+    $popup.find('#jev_world_title').text(isLayer ? `${LAYER_LABELS[key] ?? key} 계층` : key);
+    $popup.find('#jev_world_help').text(isLayer
+        ? '비워 두면 전역 설정값을 그대로 써요. 값을 넣은 칸만 이 계층의 로어북에서 달라져요.'
+        : '비워 두면 이 로어북이 속한 계층의 값을, 계층에도 없으면 전역값을 써요. 값을 넣은 칸만 이 로어북에서 달라져요.');
 
     const showEffective = () => {
         $popup.find('#jev_world_effective').text(
-            `지금 적용되는 값 — 주입 예산 ${getBudgetTokens(world).toLocaleString()}`
-            + ` · 랜덤 ${isRandomEnabled(world) ? '켜짐' : '꺼짐'}`
-            + ` · 랜덤 예산 ${getRandomBudget(world).toLocaleString()}`
-            + ` · 회수 후보 ${getQueryTopK(world)}`);
+            `지금 적용되는 값 — 주입 예산 ${getBudgetTokens(argWorld, argLayer).toLocaleString()}`
+            + ` · 랜덤 ${isRandomEnabled(argWorld, argLayer) ? '켜짐' : '꺼짐'}`
+            + ` · 랜덤 예산 ${getRandomBudget(argWorld, argLayer).toLocaleString()}`
+            + ` · 회수 후보 ${getQueryTopK(argWorld, argLayer)}`);
     };
 
-    const setKey = (key, value) => {
-        let r = rec();
-        if (!r) { r = {}; store[world] = r; }
-        if (value === undefined) delete r[key];
-        else r[key] = value;
-        if (!Object.keys(r).length) delete store[world];
-        saveSettingsDebounced();
-        showEffective();
+    const refreshLists = () => {
         void renderLayerList();
+        renderLayerOverrides();
         void renderBudgetTotal();
     };
 
-    // 숫자 3칸 — placeholder에 현재 전역값을 찍는다. "이 칸을 안 건드리면 무슨 값이 되는지"가 화면에 있어야 한다.
+    const setKey = (field, value) => {
+        let r = rec();
+        if (!r) { r = {}; store[key] = r; }
+        if (value === undefined) delete r[field];
+        else r[field] = value;
+        if (!Object.keys(r).length) delete store[key];
+        saveSettingsDebounced();
+        showEffective();
+        refreshLists();
+    };
+
+    // 숫자 3칸 — placeholder에 '안 건드리면 되는 값'(상속값)을 찍는다. 화면에 없으면 빈칸의 뜻을 모른다.
     const numberFields = [
-        { id: '#jev_world_budget', key: 'budgetTokens', min: BUDGET_TOKENS_MIN, max: BUDGET_TOKENS_MAX, fallback: getBudgetTokens() },
-        { id: '#jev_world_random_budget', key: 'randomBudgetTokens', min: RANDOM_BUDGET_MIN, max: RANDOM_BUDGET_MAX, fallback: getRandomBudget() },
-        { id: '#jev_world_topk', key: 'queryTopK', min: TOP_K_MIN, max: TOP_K_MAX, fallback: getQueryTopK() },
+        { id: '#jev_world_budget', key: 'budgetTokens', min: BUDGET_TOKENS_MIN, max: BUDGET_TOKENS_MAX, fallback: getBudgetTokens(undefined, inhLayer) },
+        { id: '#jev_world_random_budget', key: 'randomBudgetTokens', min: RANDOM_BUDGET_MIN, max: RANDOM_BUDGET_MAX, fallback: getRandomBudget(undefined, inhLayer) },
+        { id: '#jev_world_topk', key: 'queryTopK', min: TOP_K_MIN, max: TOP_K_MAX, fallback: getQueryTopK(undefined, inhLayer) },
     ];
+    const inheritLabel = isLayer ? '전역값' : '상속값';
     for (const field of numberFields) {
         const current = resolveOverride(rec()?.[field.key]);
         $popup.find(field.id)
-            .attr('placeholder', `전역값 ${field.fallback.toLocaleString()}`)
+            .attr('placeholder', `${inheritLabel} ${field.fallback.toLocaleString()}`)
             .val(current !== undefined ? String(current) : '')
             .on('input', function () {
                 const raw = String($(this).val()).trim();
@@ -3769,15 +3928,21 @@ async function openWorldSettingsPopup(world) {
             setKey('randomEnabled', value === '' ? undefined : value === 'on');
         });
 
-    $popup.find('#jev_world_reset').on('click', function () {
-        delete store[world];
+    const $reset = $popup.find('#jev_world_reset');
+    $reset.attr('title', isLayer
+        ? '이 계층의 설정을 모두 지우고 전역값을 따르게 해요'
+        : '이 로어북만의 설정을 모두 지우고 계층·전역 설정을 따르게 해요');
+    $reset.find('span').text(isLayer ? '전역값으로 되돌리기' : '북별 설정 지우기');
+    $reset.on('click', function () {
+        delete store[key];
         saveSettingsDebounced();
         for (const field of numberFields) $popup.find(field.id).val('');
         $popup.find('#jev_world_random_enabled').val('');
         showEffective();
-        void renderLayerList();
-        void renderBudgetTotal();
-        toastr.info(`'${world}'의 설정을 지웠어요 — 이제 전역값을 따라요.`, 'Jev Lorebook');
+        refreshLists();
+        toastr.info(isLayer
+            ? `${LAYER_LABELS[key] ?? key} 계층의 설정을 지웠어요 — 이제 전역값을 따라요.`
+            : `'${key}'의 설정을 지웠어요 — 이제 계층·전역 설정을 따라요.`, 'Jev Lorebook');
     });
 
     showEffective();
@@ -3805,12 +3970,14 @@ async function openInjectionSettingsPopup() {
     $popup.find('#jev_lorebook_budget').val(settings.budgetTokens).on('input', function () {
         settings.budgetTokens = clampSetting($(this).val(), BUDGET_TOKENS_MIN, BUDGET_TOKENS_MAX, defaultSettings.budgetTokens);
         saveSettingsDebounced();
+        renderLayerOverrides($popup); // 계층 4행은 전역값을 상속 표시한다 — 전역이 바뀌면 같이 바뀌어야 한다
         void renderBudgetTotal($popup);
     });
 
     $popup.find('#jev_lorebook_random_enabled').prop('checked', settings.randomEnabled === true).on('change', function () {
         settings.randomEnabled = !!$(this).prop('checked');
         saveSettingsDebounced();
+        renderLayerOverrides($popup);
         void renderLayerList($popup);   // 행의 '랜덤 후보/쿨다운'이 켜짐 여부에 따라 바뀐다
         void renderBudgetTotal($popup);
     });
@@ -3818,6 +3985,7 @@ async function openInjectionSettingsPopup() {
     $popup.find('#jev_lorebook_random_budget').val(getRandomBudget()).on('input', function () {
         settings.randomBudgetTokens = clampSetting($(this).val(), RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
         saveSettingsDebounced();
+        renderLayerOverrides($popup);
         void renderBudgetTotal($popup);
     });
 
@@ -3827,6 +3995,7 @@ async function openInjectionSettingsPopup() {
         settings.queryTopK = value;
         $popup.find('#jev_lorebook_topk_value').text(String(value));
         saveSettingsDebounced();
+        renderLayerOverrides($popup);
     });
     $popup.find('#jev_lorebook_topk_value').text(String(getQueryTopK()));
 
@@ -3835,7 +4004,9 @@ async function openInjectionSettingsPopup() {
         $popup.find(selector).prop('checked', settings[key] !== false).on('change', function () {
             settings[key] = !!$(this).prop('checked');
             saveSettingsDebounced();
+            invalidateWorldLayerCache(); // 캐시 무효화 지점 ③ — 감지 층 on/off로 북의 귀속 계층이 바뀐다
             void renderLayerList($popup);
+            renderLayerOverrides($popup);
             void fillTopKTotal($popup);
             void renderBudgetTotal($popup);
             void renderDetectionSummary(); // 확장 탭 한 줄도 같이 따라가야 한다
@@ -3845,7 +4016,9 @@ async function openInjectionSettingsPopup() {
     $popup.find('#jev_lorebook_world').on('change', function () {
         settings.world = String($(this).val());
         saveSettingsDebounced();
+        invalidateWorldLayerCache(); // 캐시 무효화 지점 ④ — 고정 대상은 'fixed' 층으로 귀속이 바뀐다
         void renderLayerList($popup);
+        renderLayerOverrides($popup);
         void fillTopKTotal($popup);
         void renderBudgetTotal($popup);
         void renderDetectionSummary();
@@ -3853,6 +4026,7 @@ async function openInjectionSettingsPopup() {
 
     populateWorldSelect($popup);
     void fillTopKTotal($popup);
+    renderLayerOverrides($popup);
     void renderLayerList($popup);
     void renderBudgetTotal($popup);
 
@@ -3999,6 +4173,7 @@ jQuery(async () => {
     // 확장 로드 시점엔 이미 채팅이 열려 있을 수 있어 CHAT_CHANGED가 안 온다 → 여기서 1회 직접 돌린다.
     if (event_types.CHAT_CHANGED) {
         eventSource.on(event_types.CHAT_CHANGED, () => {
+            invalidateWorldLayerCache(); // 캐시 무효화 지점 ① — 감지 대상은 채팅에 딸려 바뀐다
             void runHeaderMigration();
             resetRandomCooldown(); // 🎲 채팅이 바뀌면 쿨다운 링버퍼를 비운다 (v0.15.0)
             void renderDetectionSummary(); // 감지 대상은 채팅에 딸려 바뀐다 — 한 줄 요약도 따라가야 한다 (v0.17.0)
@@ -4010,6 +4185,7 @@ jQuery(async () => {
 
     if (event_types.WORLDINFO_UPDATED) {
         eventSource.on(event_types.WORLDINFO_UPDATED, () => {
+            invalidateWorldLayerCache(); // 캐시 무효화 지점 ② — 로어북 목록·연결이 바뀜
             populateWorldSelect();
             void renderLayerList();
             void renderDetectionSummary();
