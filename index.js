@@ -34,6 +34,7 @@ import {
     openDetailPanel,
     recordActivatedEntries,
     runHeaderMigration,
+    guardPeerExclusive,
 } from './src/core.js';
 import {
     indexLorebook,
@@ -79,12 +80,22 @@ globalThis[SELF_GLOBAL_MARKER] = true;
 jQuery(async () => {
     const settings = getSettings();
 
+    // ⚠️ DOM id는 flavor화하지 않는다(사양) — 그래서 자매 확장을 둘 다 설치하면 공용 마크업의 id가
+    // 문서에 두 벌 생긴다. 전역 `$('#id')`는 먼저 로드된 쪽을 집으므로 **자기 서랍으로 스코프**한다.
+    // (제브 전용 id는 논제브 배포본에서 마크업째 제거되므로 충돌 대상이 아니다.)
     const html = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'settings');
-    $('#extensions_settings2').append(html);
-    $('#jev_lorebook_title').text(DISPLAY_NAME);
+    const $drawer = $(html);
+    $('#extensions_settings2').append($drawer);
+    $drawer.find('#jev_lorebook_title').text(DISPLAY_NAME);
 
-    $('#jev_lorebook_enabled').prop('checked', settings.enabled).on('change', function () {
-        settings.enabled = !!$(this).prop('checked');
+    $drawer.find('#jev_lorebook_enabled').prop('checked', settings.enabled).on('change', async function () {
+        const want = !!$(this).prop('checked');
+        // 상호 배제 (v0.19.0) — 상대가 켜져 있으면 되묻고, 승인 시 원클릭으로 저쪽을 끈다.
+        if (want && !(await guardPeerExclusive('enable'))) {
+            $(this).prop('checked', false);
+            return;
+        }
+        settings.enabled = want;
         saveSettingsDebounced();
     });
 
@@ -139,7 +150,7 @@ jQuery(async () => {
     // 세부 설정 팝업 2개 (v0.17.0) — 값 주입·바인딩·목록 렌더는 '열 때마다' 팝업 함수 안에서 다시 한다.
     // 팝업이 닫히면 DOM이 통째로 사라지므로 로드 1회 바인딩으로 두면 두 번째로 열 때 컨트롤이 전부 죽는다.
     $('#jev_lorebook_open_injection').on('click', () => void openInjectionSettingsPopup());
-    $('#jev_lorebook_open_convert').on('click', () => void openConvertSettingsPopup());
+    $drawer.find('#jev_lorebook_open_convert').on('click', () => void openConvertSettingsPopup());
 
     void renderDetectionSummary();
 

@@ -659,3 +659,32 @@
     opacity: 0.75;
     word-break: keep-all;
 }
+
+/* ── 전문 펼침의 발동 배지 + 키 칩 (v0.19.0, 양쪽 공용) ──────────────────
+   색은 ST 테마 변수 기반 — 확장이 자기 팔레트를 들고 오면 테마를 바꾼 사용자 화면에서 튄다. */
+.jev-detail-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.jev-fire-badge {
+    font-size: 0.8em;
+    padding: 1px 7px;
+    border-radius: 9px;
+    background-color: var(--SmartThemeQuoteColor);
+    color: var(--SmartThemeBlurTintColor);
+    white-space: nowrap;
+}
+
+.jev-key-chip {
+    font-size: 0.8em;
+    padding: 1px 7px;
+    border-radius: 9px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    opacity: 0.85;
+    white-space: nowrap;
+    font-family: monospace;
+}

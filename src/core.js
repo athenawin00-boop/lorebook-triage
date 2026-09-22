@@ -23,7 +23,7 @@ import { getStringHash, timestampToMoment, getCharaFilename } from '../../../../
 import { callGenericPopup, POPUP_TYPE, POPUP_RESULT } from '../../../../popup.js';
 import { ConnectionManagerRequestService } from '../../../shared.js';
 import { hideChatMessageRange } from '../../../../chats.js';
-import { MODULE, TEMPLATE_PATH, LOG, DISPLAY_NAME } from './flavor.js';
+import { MODULE, TEMPLATE_PATH, LOG, DISPLAY_NAME, PEER_MODULE, PEER_DISPLAY_NAME, PEER_GLOBAL_MARKER } from './flavor.js';
 import { hooks } from './hooks.js';
 
 // ── flavor 훅 경계 (v0.19.0) ─────────────────────────────────────────────
@@ -38,6 +38,96 @@ export const vectorList = (world) => hooks.vectorList ? hooks.vectorList(world) 
 export const getBudgetTokens = (world, layer) => hooks.budgetTokens ? hooks.budgetTokens(world, layer) : 0;
 export const renderPanelJudgment = ($box, rejected) => hooks.renderPanelJudgment?.($box, rejected);
 export const openInjectionSettingsPopup = () => hooks.openInjectionSettings?.();
+
+// ── 항목 키 정제 (v0.19.0) ───────────────────────────────────────────────
+// 변환 파서는 v0.6.0부터 모델의 `Keywords:` 줄을 읽어 **버리고** 있었다(배관은 살아 있었다).
+// 그 배관을 살려 `inc.keys`로 돌려준다. 소비는 flavor가 결정한다:
+//   - 제브 로어북  : 소비하지 않는다. 항목은 계속 `key: []`다(발동은 Jev 단일 경로, v0.6.0 결정 유지).
+//   - 논제브 로어북: 변환 시작 팝업에서 「초록불 + AI 키워드」를 고른 경우에만 소비한다.
+// 왜 영어 단일 단어만인가: ST `world_info_match_whole_words`가 기본 켜짐이라 두 단어 구절은
+// 실채팅에서 거의 안 걸리고(실측 — `['club zion']`이 "클럽 zion에 가?"에 불발), 한글은 형태소가
+// 붙어 원형 매칭이 깨진다. 범용어는 매 턴 걸려서 선별을 무의미하게 만든다.
+const ENTRY_KEY_RE = /^[A-Za-z][A-Za-z'-]*$/;
+export const ENTRY_KEY_MAX = 5;
+const ENTRY_KEY_STOPWORDS = new Set([
+    'love', 'night', 'day', 'time', 'he', 'she', 'it', 'they', 'him', 'her', 'them', 'his', 'hers',
+    'the', 'a', 'an', 'and', 'or', 'but', 'if', 'then', 'this', 'that', 'these', 'those',
+    'good', 'bad', 'new', 'old', 'big', 'small', 'man', 'woman', 'boy', 'girl', 'people', 'person',
+    'thing', 'things', 'place', 'room', 'home', 'house', 'work', 'life', 'world', 'way',
+    'today', 'tonight', 'yesterday', 'tomorrow', 'morning', 'evening', 'now', 'here', 'there',
+    'i', 'you', 'we', 'me', 'us', 'my', 'your', 'our', 'is', 'are', 'was', 'were', 'be', 'been',
+]);
+
+/**
+ * 모델이 준 키워드 후보를 항목 키로 쓸 수 있는 것만 남긴다 — 순수 함수(단위검증 대상).
+ * 영어 단일 단어 → 소문자 정규화 → 스톱워드 제거 → 중복 제거 → 상한 ENTRY_KEY_MAX.
+ * 입력이 배열이 아니거나(파서 실패) 빈 경우엔 빈 배열이다 — 호출부가 길이만 보면 된다.
+ */
+export function sanitizeEntryKeys(raw) {
+    const out = [];
+    for (const item of (Array.isArray(raw) ? raw : [])) {
+        const word = String(item ?? '').trim();
+        if (!ENTRY_KEY_RE.test(word)) continue;          // 구절·한글·기호 섞임 전부 탈락
+        const key = word.toLowerCase();
+        if (ENTRY_KEY_STOPWORDS.has(key)) continue;
+        if (out.includes(key)) continue;
+        out.push(key);
+        if (out.length >= ENTRY_KEY_MAX) break;
+    }
+    return out;
+}
+
+// ── 상호 배제 (v0.19.0) ──────────────────────────────────────────────────
+// 자매 배포본(제브 / 논제브)은 같은 로어북·같은 chat_metadata 이력에 손을 댄다.
+// 둘이 동시에 켜져 있으면 변환 지점과 되돌리기 스냅샷이 서로를 덮는다 → 한쪽만 켜도록 막는다.
+
+/**
+ * 상대 확장이 **실제로 활성인가.**
+ * 🔑 `extension_settings` 단독 판정은 확장을 지운 뒤 남은 설정으로 오탐한다(설정은 확장 폴더가 아니라
+ * ST settings.json에 살아서 폴더를 삭제해도 안 날아간다 — v0.5 실측). 그래서 런타임 로드 마커와 AND로 건다.
+ */
+export function isPeerActive() {
+    if (!globalThis[PEER_GLOBAL_MARKER]) return false;
+    return extension_settings?.[PEER_MODULE]?.enabled === true;
+}
+
+/**
+ * 상대가 켜져 있으면 막고, 원클릭 전환을 제안한다.
+ * @param {'enable'|'convert'} action 무엇을 하려다 막혔는지 (문구 분기용)
+ * @returns {Promise<boolean>} 계속 진행해도 되는가
+ */
+export async function guardPeerExclusive(action) {
+    if (!isPeerActive()) return true;
+    const $content = $('<div>').append(
+        $('<p>').text(`${PEER_DISPLAY_NAME}이 켜져있어요. 끄고 사용이 가능해요.`),
+        $('<p class="jev-panel-muted">').text(action === 'convert'
+            ? '두 확장이 같은 로어북과 같은 변환 이력을 쓰기 때문에, 둘 다 켜두면 변환 지점과 되돌리기 기록이 서로를 덮어써요.'
+            : '두 확장은 같은 변환 이력을 공유해요. 한 번에 하나만 켜 주세요.'),
+    );
+    const result = await callGenericPopup($content, POPUP_TYPE.CONFIRM, '', {
+        okButton: `${PEER_DISPLAY_NAME} 끄고 ${DISPLAY_NAME} 켜기`,
+        cancelButton: '그만두기',
+    });
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return false;
+    // 원클릭 전환 — 상대를 끄고 이쪽을 켠다. 두 네임스페이스는 별개라 서로의 값을 망가뜨리지 않는다.
+    if (extension_settings?.[PEER_MODULE]) extension_settings[PEER_MODULE].enabled = false;
+    getSettings().enabled = true;
+    saveSettingsDebounced();
+    toastr.success(`${PEER_DISPLAY_NAME}을 끄고 ${DISPLAY_NAME}을 켰어요. 상대 확장 화면은 새로고침하면 반영돼요.`, DISPLAY_NAME);
+    return true;
+}
+
+/**
+ * 이 항목이 **직전 턴 프롬프트에 들어갔나** (v0.19.0 — 발동 배지).
+ * 근거는 이미 구독 중인 `WORLD_INFO_ACTIVATED` 스냅샷 하나뿐이다(world-info.js:902, dryRun 아닐 때만).
+ * ⚠️ 어느 **키가** 걸렸는지는 표시하지 않는다 — 그건 ST가 알려주지 않아 우리가 재매칭해야 하고,
+ * 재매칭 결과는 ST의 실제 판정(정규식·whole words·대소문자·sticky)과 어긋날 수 있다. 발주 기각 사항.
+ */
+export function isRecentlyActivated(world, uid) {
+    if (!lastActivated || !Array.isArray(lastActivated.entries)) return false;
+    return lastActivated.entries.some(e => String(e.world) === String(world) && String(e.uid) === String(uid));
+}
+
 
 export const DEFAULT_TOP_K = 30;        // 벡터 회수 후보 수 기본값 — 20으론 Jev 상위권을 놓침(2026-09-20 실측). v0.7.0에서 설정(20~50)으로 개방
 
@@ -640,6 +730,19 @@ export function buildDetailToggle(content, colSpan, meta = null) {
             .append($('<div class="jev-detail-translation-body">').text(translation.text)));
     }
 
+    // 발동 배지 + 키 칩 (v0.19.0). 삽입은 textContent로만 — 키는 모델·사용자가 쓴 값이라 HTML로 넣으면 XSS다.
+    const $badges = $('<div class="jev-detail-meta">');
+    if (meta && isRecentlyActivated(meta.world, meta.uid)) {
+        $badges.append($('<span class="jev-fire-badge">')
+            .attr('title', '직전 턴 프롬프트에 이 항목이 들어갔어요')
+            .text('발동됨'));
+    }
+    for (const key of (Array.isArray(meta?.keys) ? meta.keys : [])) {
+        const label = String(key ?? '').trim();
+        if (label) $badges.append($('<span class="jev-key-chip">').text(label));
+    }
+    if ($badges.children().length) $detailCell.prepend($badges);
+
     const $detail = $('<tr class="jev-detail-row" style="display: none;">').append($detailCell);
 
     const toggleDetail = () => {
@@ -821,6 +924,7 @@ export function parseConversionOutput(text) {
         if (!current) return;
         current.body = current.bodyLines.join('\n').trim();
         delete current.bodyLines;
+        current.keys = sanitizeEntryKeys(current.keywords); // v0.19.0 — 소비는 flavor가 결정한다
         if (current.body) incidents.push(current);
         current = null;
     };
@@ -1472,6 +1576,9 @@ export async function convertChatToLorebook(setStatus) {
             entry.content = buildIncidentContent(inc.date, inc.title, inc.body);
             entry.constant = false;
             entry.disable = false;
+            // flavor 후처리 (v0.19.0) — 논제브는 여기서 팝업 선택에 따라 constant·key·preventRecursion을 얹는다.
+            // 제브는 이 훅을 등록하지 않으므로 위 기본값(검색층 · 키 없음)이 그대로 남는다.
+            hooks.decorateNewEntry?.(entry, inc);
         }
 
         // 2b. 코어 규칙/일기 upsert — constant:true = ST가 매턴 네이티브 주입 (Jev 판정·색인 밖, 설계 의도).
@@ -2218,7 +2325,7 @@ export async function renderPanelChunks($panel) {
             $tr.append($('<td>').text(approxTokens(content)));
             $tr.append(buildStateToggle(world, e.uid, getEntryState(e), $panel));
 
-            const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid });
+            const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid, keys: e.key });
             $tr.append($cell);
             $tbody.append($tr).append($detail);
         }
@@ -2278,7 +2385,7 @@ export async function renderPanelChunks($panel) {
                 $tr.append($('<td>').text(approxTokens(content)));
                 $tr.append(buildStateToggle(world, e.uid, getEntryState(e), $panel));
 
-                const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid });
+                const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid, keys: e.key });
                 $tr.append($cell);
                 $coreBody.append($tr).append($detail);
             }
@@ -2396,7 +2503,7 @@ export function renderPanelInjected($panel) {
             $tr.append($tok);
 
             // 전문 펼침은 기존 패턴 재사용 (buildDetailToggle, v0.6.4)
-            const { $cell, $detail } = buildDetailToggle(content, headers.length, { world: r.entry.world, uid: r.entry.uid });
+            const { $cell, $detail } = buildDetailToggle(content, headers.length, { world: r.entry.world, uid: r.entry.uid, keys: r.entry.key });
             $tr.append($cell);
             $tbody.append($tr).append($detail);
 
@@ -2478,6 +2585,11 @@ export async function openDetailPanel() {
     $panel.find('#jev_panel_convert').on('click', async function () {
         const $button = $(this);
         if ($button.hasClass('disabled')) return;
+        // 상호 배제 (v0.19.0) — 켜기와 변환 둘 다 막는다. 켜기만 막으면 '꺼진 채로 변환'이 통과해서
+        // 두 확장이 같은 변환 지점·되돌리기 스냅샷을 번갈아 덮는 경로가 그대로 남는다.
+        if (!(await guardPeerExclusive('convert'))) return;
+        // 변환 시작 게이트 (v0.19.0) — 논제브는 여기서 팝업 3옵션을 띄운다. false면 변환 자체를 안 한다.
+        if (hooks.beforeConvert && !(await hooks.beforeConvert())) return;
         $button.addClass('disabled');
         try {
             await convertChatToLorebook(setConvertStatus);
@@ -2705,6 +2817,7 @@ export function recordActivatedEntries(entries) {
             comment: String(e?.comment ?? ""),
             content: String(e?.content ?? ""),
             constant: e?.constant === true,
+            key: Array.isArray(e?.key) ? e.key.map(k => String(k)) : [], // v0.19.0 — 키 칩 표시용
         })),
     };
 }
