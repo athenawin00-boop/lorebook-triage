@@ -583,3 +583,70 @@
     white-space: pre-wrap;
     word-break: break-word;
 }
+
+/* ── 항목 3상태 (v0.17.0) ─────────────────────────────────────────────
+   🔵 상시(코어) / 🟢 검색층 / ⚫ 꺼짐. disable과 constant는 독립 필드라
+   끌 때 constant를 보존하면 '원래 색'이 항목 안에 남는다 → 복귀에 별도 저장소가 필요 없다. */
+.jev-core-toggle.jev-is-off i {
+    color: #8a8a8a;
+}
+
+/* 꺼진 항목은 두 표에서 사라지지 않고 회색 행으로 남는다 —
+   그 행의 동그라미가 확장 안에서 되살릴 수 있는 유일한 경로다. */
+.jev-panel-table tr.jev-row-off {
+    opacity: 0.45;
+    font-style: italic;
+}
+
+.jev-panel-table tr.jev-row-off:hover {
+    opacity: 0.75;
+}
+
+/* ── 확장 탭 감지 요약 한 줄 (v0.17.0) ───────────────────────────── */
+.jev-detect-summary {
+    opacity: 0.8;
+    font-size: 0.95em;
+}
+
+/* 세부 설정 팝업 버튼 2개 — 좁은 화면에서는 줄바꿈으로 흘린다 */
+.jev-lorebook-settings .jev-set-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+/* ── 주입 예산 합계 한 줄 (v0.17.0, 팝업 A) ──────────────────────
+   숫자 세 통(코어·검색·랜덤)이 매 턴 얼마가 되는지를 한 줄로 못박는다. */
+.jev-budget-total {
+    margin-top: 4px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background-color: rgba(128, 128, 128, 0.12);
+    font-size: 0.92em;
+}
+
+/* ── 로어북별 설정 (v0.17.0, 요구 H) ─────────────────────────────── */
+.jev-override-badge {
+    border-color: rgba(230, 180, 60, 0.7);
+    opacity: 1;
+}
+
+.jev-layer-gear {
+    cursor: pointer;
+    opacity: 0.6;
+    padding: 0 4px;
+}
+
+.jev-layer-gear:hover,
+.jev-layer-gear:focus-visible {
+    opacity: 1;
+}
+
+/* 팝업 본문 — 설정탭과 같은 세로 스택을 쓰되 좌측 정렬은 팝업 옵션(leftAlign)이 맡는다 */
+.jev-popup-body {
+    text-align: left;
+}
+
+.jev-popup-body h3 {
+    margin: 0 0 6px;
+}

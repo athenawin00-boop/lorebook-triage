@@ -219,12 +219,14 @@ let lastTransportError = null;
 let lastConvertWarnings = [];
 /**
  * 🎲 랜덤 주입 상태 (v0.15.0).
- * recentRandomUids = 쿨다운 링버퍼(`${world}.${uid}`). 최근 뽑힌 건 한동안 다시 안 뽑는다. CHAT_CHANGED에서 비운다.
+ * recentRandomUids = 로어북별 쿨다운 링버퍼 Map (world → [`${world}.${uid}`, …]). 최근 뽑힌 건 한동안 다시 안 뽑는다.
+ *                    v0.17.0에서 통합 배열을 북별 Map으로 갈랐다 — 통합 풀이면 큰 북의 항목이 링버퍼를 채워
+ *                    작은 북의 쿨다운을 밀어낸다. CHAT_CHANGED에서 비운다.
  * lastRandomItems  = 직전 턴에 뽑힌 항목. 판정 캐시 히트 턴에는 새로 뽑지 않고 이걸 그대로 재주입한다
  *                    (같은 턴의 연쇄 quiet 생성에서 주입물이 흔들리면 안 된다).
  * lastRandomKeys   = 패널 「직전 턴」 표의 🎲 분류용 키 집합.
  */
-let recentRandomUids = [];
+let recentRandomUids = new Map();
 let lastRandomItems = [];
 let lastRandomKeys = new Set();
 
@@ -283,6 +285,10 @@ const DEFAULT_INCIDENT_MAX_TOKENS = 500;
 const RANDOM_BUDGET_MIN = 0;
 const RANDOM_BUDGET_MAX = 20000;
 const DEFAULT_RANDOM_BUDGET = 500;
+// 주입 예산 범위 (v0.17.0) — settings.html의 min/max와 같은 값을 쓴다.
+// 로어북별 오버라이드도 전역과 같은 범위로 클램프한다 — 창구가 둘인데 허용 범위가 다르면 설명할 수 없다.
+const BUDGET_TOKENS_MIN = 500;
+const BUDGET_TOKENS_MAX = 20000;
 
 const defaultSettings = Object.freeze({
     enabled: false,
@@ -312,6 +318,12 @@ const defaultSettings = Object.freeze({
     randomEnabled: false,                       // 🎲 랜덤 주입 (기본 꺼짐)
     randomBudgetTokens: DEFAULT_RANDOM_BUDGET,  // 랜덤 전용 예산 — budgetTokens와 합산하지 않는다
     headerMigratedWorlds: [],                   // 본문 날짜 헤더 마이그레이션이 끝난 로어북 이름 (로어북당 1회용 마커)
+    // ── v0.17.0 신규 ──
+    // 로어북별 파라미터 오버라이드: `{ "<로어북 이름>": { budgetTokens?, randomEnabled?, randomBudgetTokens?, queryTopK? } }`
+    // 키가 없거나 빈 문자열이면 전역값을 상속한다(전부 강제 지정하게 만들지 않는다).
+    // ⚠ 저장 키가 로어북 '이름'이라 ST에서 이름을 바꾸면 이 레코드는 고아가 된다. 정리 로직은 두지 않기로 확정했다
+    //   (발주자 결정: 방치). 고아 레코드는 어느 북에도 매칭되지 않아 동작에 영향이 없다.
+    perWorld: {},
 });
 
 /** 설정 숫자 방어 — 설정 파일이 손으로 망가졌어도 파이프라인은 돌아가야 한다 */
@@ -333,8 +345,70 @@ function getIncidentMaxTokens() {
     return clampSetting(getSettings().incidentMaxTokens, INCIDENT_TOKENS_MIN, INCIDENT_TOKENS_MAX, DEFAULT_INCIDENT_MAX_TOKENS);
 }
 
-function getRandomBudget() {
-    return clampSetting(getSettings().randomBudgetTokens, RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
+// ── 로어북별 파라미터 오버라이드 (v0.17.0) ─────────────────────────────
+// 전역 1벌이던 네 값(주입 예산 / 랜덤 켜기 / 랜덤 예산 / topK)을 로어북 단위로 덮어쓸 수 있게 한다.
+// 네 게터는 전부 world 인자를 '선택'으로 받는다 — 인자가 없으면 전역값을 돌려주므로 기존 호출부가 그대로 동작한다.
+const PER_WORLD_KEYS = Object.freeze(['budgetTokens', 'randomEnabled', 'randomBudgetTokens', 'queryTopK']);
+
+/**
+ * 오버라이드 저장소. 없으면 만든다.
+ * ⚠ getSettings()의 결손 키 보충은 `defaultSettings[key]`를 **참조로** 물려준다(Object.freeze는 얕다).
+ *   기존 설치가 업그레이드될 때 defaultSettings.perWorld 객체를 그대로 쓰게 되므로 여기서 자기 소유 객체로 갈아둔다.
+ */
+function getPerWorldStore() {
+    const settings = getSettings();
+    const store = settings.perWorld;
+    const usable = store && typeof store === 'object' && !Array.isArray(store);
+    if (!usable || store === defaultSettings.perWorld) {
+        settings.perWorld = usable ? { ...store } : {};
+    }
+    return settings.perWorld;
+}
+
+/**
+ * 오버라이드 값 해석 — '미설정'은 undefined·null·빈 문자열 셋뿐이다.
+ * `0`과 `false`는 사용자가 고른 정당한 값이라 falsy로 뭉개 전역값으로 새게 두면 안 된다
+ * (랜덤 켜기를 그 북만 끄는 것과 '미설정'은 다른 상태다).
+ */
+function resolveOverride(value) {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value === 'string' && value.trim() === '') return undefined;
+    return value;
+}
+
+/** 이 로어북의 오버라이드 레코드 — 없거나 형식이 깨졌으면 null */
+function getWorldOverride(world) {
+    if (!world) return null;
+    const rec = getPerWorldStore()[world];
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return null;
+    return rec;
+}
+
+/** 지정된 값이 하나라도 있나 — 감지 목록의 '설정 있음' 배지 판정 */
+function hasWorldOverride(world) {
+    const rec = getWorldOverride(world);
+    return !!rec && PER_WORLD_KEYS.some(key => resolveOverride(rec[key]) !== undefined);
+}
+
+/** 주입 예산 — 북별 오버라이드 우선, 없으면 전역값 */
+function getBudgetTokens(world) {
+    const override = resolveOverride(getWorldOverride(world)?.budgetTokens);
+    const raw = override !== undefined ? override : getSettings().budgetTokens;
+    return clampSetting(raw, BUDGET_TOKENS_MIN, BUDGET_TOKENS_MAX, defaultSettings.budgetTokens);
+}
+
+/** 랜덤 주입 예산 — 북별 오버라이드 우선, 없으면 전역값 */
+function getRandomBudget(world) {
+    const override = resolveOverride(getWorldOverride(world)?.randomBudgetTokens);
+    const raw = override !== undefined ? override : getSettings().randomBudgetTokens;
+    return clampSetting(raw, RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
+}
+
+/** 랜덤 주입 켜짐 여부 — 북별 오버라이드 우선. 체크박스라 '미설정'과 false를 반드시 갈라야 한다 */
+function isRandomEnabled(world) {
+    const override = resolveOverride(getWorldOverride(world)?.randomEnabled);
+    if (override !== undefined) return override === true;
+    return getSettings().randomEnabled === true;
 }
 
 /** 변환·숨김에서 제외할 최근 메시지 수. 설정탭과 요술봉 패널 두 창구가 같은 값을 쓴다 (v0.15.0) */
@@ -343,8 +417,11 @@ function getKeepRecent() {
     return Number.isFinite(value) && value >= 0 ? Math.floor(value) : defaultSettings.keepRecent;
 }
 
-function getQueryTopK() {
-    return clampSetting(getSettings().queryTopK, TOP_K_MIN, TOP_K_MAX, DEFAULT_TOP_K);
+/** 회수 후보 수(topK) — 북별 오버라이드 우선, 없으면 전역값. 회수는 원래부터 북별 쿼리라 그대로 먹는다 */
+function getQueryTopK(world) {
+    const override = resolveOverride(getWorldOverride(world)?.queryTopK);
+    const raw = override !== undefined ? override : getSettings().queryTopK;
+    return clampSetting(raw, TOP_K_MIN, TOP_K_MAX, DEFAULT_TOP_K);
 }
 
 /** 비어 두면 기본 스타일 — "비우면 기본값"이 복원 버튼과 같은 의미가 되게 한다 */
@@ -378,6 +455,18 @@ const LAYER_LABELS = Object.freeze({
     persona: '페르소나',
     character: '캐릭터',
     global: '전역',
+});
+
+/**
+ * 감지 대상 층 체크박스 ↔ 설정 키 (v0.8.0).
+ * v0.17.0에서 이 마크업이 팝업 A로 옮겨가면서 jQuery 초기화 블록 안에 있던 상수를 모듈 스코프로 끌어올렸다
+ * — 팝업은 열 때마다 새로 바인딩하므로 매핑이 초기화 함수 지역변수로 있으면 안 된다.
+ */
+const LAYER_INPUTS = Object.freeze({
+    layerChat: '#jev_lorebook_layer_chat',
+    layerChar: '#jev_lorebook_layer_char',
+    layerGlobal: '#jev_lorebook_layer_global',
+    layerPersona: '#jev_lorebook_layer_persona',
 });
 
 /**
@@ -552,27 +641,62 @@ async function vectorPurge(worldName) {
 }
 
 /**
- * 항목을 코어(constant) ↔ 검색층 사이로 옮긴다 (v0.6.4).
+ * 항목 3상태 (v0.17.0) — 🔵 상시(코어) / 🟢 검색층 / ⚫ 꺼짐.
  *
- * 승격(검색층 → 코어): constant=true + order=1000.
- *   벼터는 그대로 두어도 된다 — 후보 회수부가 constant 항목을 이미 걸러낸다(이중 주입 없음).
- *   남은 벡터는 다음 재색인 때 자동으로 청소된다 → 임베딩 호출 0회.
- * 강등(코어 → 검색층): constant=false + order=100 + 그 항목만 벡터에 삽입 → 임베딩 1회.
+ * `disable`과 `constant`는 ST 엔트리의 **독립 필드**다. 그래서 끌 때 `disable`만 세우고 `constant`를 보존하면
+ * "원래 무슨 색이었나"가 항목 안에 그대로 남는다 → 별도 백업 저장소를 만들 필요가 없다.
  */
-async function setEntryCore(world, uid, toCore) {
+const ENTRY_STATE_CORE = 'core';
+const ENTRY_STATE_SEARCH = 'search';
+const ENTRY_STATE_OFF = 'off';
+
+/** 엔트리의 현재 상태. 꺼짐이 constant보다 우선한다 — 꺼진 파랑도 화면에선 회색이다 */
+function getEntryState(entry) {
+    if (entry?.disable) return ENTRY_STATE_OFF;
+    return entry?.constant ? ENTRY_STATE_CORE : ENTRY_STATE_SEARCH;
+}
+
+/**
+ * 클릭 1회의 다음 상태와 패치 — 순수 함수(단위검증 대상).
+ * 🔵 → 🟢 → ⚫ → (원래 색). 회색에서 복귀할 때 `constant`/`order`를 **건드리지 않는 것**이 이 설계의 핵심이다.
+ * needsIndex = 그 항목만 단건 벡터 삽입이 필요한가. 검색층으로 들어오는 경로에서만 true다
+ * (코어는 회수 후보 필터가 constant를 이미 거르므로 색인 대상이 아니다).
+ */
+function planEntryStateCycle(entry) {
+    const state = getEntryState(entry);
+    if (state === ENTRY_STATE_CORE) {
+        // 강등 — order를 같이 되돌린다. 안 되돌리면 검색층인데 프롬프트 최상단 자리를 계속 차지한다.
+        return { from: state, to: ENTRY_STATE_SEARCH, patch: { constant: false, order: NORMAL_ORDER }, needsIndex: true };
+    }
+    if (state === ENTRY_STATE_SEARCH) {
+        // 끄기 — 벡터는 지우지 않는다. 회수 후보 필터가 disable을 이미 거르고, 남은 벡터는 다음 재색인에서 정리된다.
+        return { from: state, to: ENTRY_STATE_OFF, patch: { disable: true }, needsIndex: false };
+    }
+    // 복귀 — disable만 해제한다. constant가 살아 있으면 파랑, 없으면 초록으로 저절로 돌아간다.
+    const restored = entry?.constant ? ENTRY_STATE_CORE : ENTRY_STATE_SEARCH;
+    return { from: state, to: restored, patch: { disable: false }, needsIndex: restored === ENTRY_STATE_SEARCH };
+}
+
+/**
+ * 항목 상태를 한 칸 돌린다 (v0.17.0 — v0.6.4의 2상태 전환 함수를 대체).
+ * 검색층으로 들어오는 경로(강등·회색에서 복귀)에서만 그 항목 하나를 벡터에 삽입한다 → 임베딩 1회.
+ * 코어로 가는 경로는 임베딩 0회다.
+ */
+async function cycleEntryState(world, uid) {
     const worldData = await loadWorldInfo(world);
     const entry = worldData?.entries?.[uid];
     if (!entry) throw new Error(`uid ${uid} 항목을 찾지 못했어요`);
 
-    entry.constant = !!toCore;
-    entry.order = toCore ? CORE_RULES_ORDER : NORMAL_ORDER;
+    const plan = planEntryStateCycle(entry);
+    Object.assign(entry, plan.patch);
     await saveWorldInfo(world, worldData, true);
 
-    if (!toCore) {
+    if (plan.needsIndex) {
         const content = String(entry.content ?? '');
         await vectorInsert(world, [{ hash: getStringHash(content), text: content, index: Number(uid) }]);
     }
-    console.log(`${LOG} '${world}' uid ${uid} → ${toCore ? '코어(constant, order 1000)' : '검색층(order 100, 벡터 삽입)'}`);
+    console.log(`${LOG} '${world}' uid ${uid} — ${plan.from} → ${plan.to} (patch=${JSON.stringify(plan.patch)}, 벡터 삽입 ${plan.needsIndex ? '1건' : '없음'})`);
+    return plan;
 }
 
 /** 대략 토큰수 (chars/4) — 패널 표시용 근사치 */
@@ -693,25 +817,38 @@ function buildDetailToggle(content, colSpan, meta = null) {
 }
 
 /**
- * 코어 ↔ 검색층 전환 셀 (v0.6.4) — 파란 원 = 상시(코어), 초록 원 = 검색층.
- * 확인 팝업 없음(현이 결정) — 다시 누르면 되돌아가고 합계 토큰이 즉시 보이므로 피드백이 충분하다.
+ * 항목 상태 전환 셀 (v0.17.0 — v0.6.4의 2상태 토글을 3상태로 확장).
+ * 🔵 상시(코어) → 🟢 검색층 → ⚫ 꺼짐 → 원래 색. 확인 팝업 없음(기존 전환 버튼과 같은 정책).
+ * ⚫ 회색 행에서도 이 버튼이 동작해야 한다 — 확장 안에서 꺼진 항목을 되살릴 수 있는 유일한 경로다.
  */
-function buildCoreToggle(world, uid, isCore, $panel) {
+const ENTRY_STATE_CLASS = Object.freeze({
+    [ENTRY_STATE_CORE]: 'jev-is-core',
+    [ENTRY_STATE_SEARCH]: 'jev-is-search',
+    [ENTRY_STATE_OFF]: 'jev-is-off',
+});
+const ENTRY_STATE_TITLE = Object.freeze({
+    [ENTRY_STATE_CORE]: '상시 메모리(코어) — 누르면 검색층으로 내려요',
+    [ENTRY_STATE_SEARCH]: '검색층 메모리 — 누르면 이 항목을 꺼요',
+    [ENTRY_STATE_OFF]: '꺼진 항목 — 누르면 원래 상태(상시 또는 검색층)로 되돌려요',
+});
+const ENTRY_STATE_DONE_TOAST = Object.freeze({
+    [ENTRY_STATE_CORE]: '상시 메모리(코어)로 되돌렸어요 — 매 턴 다시 주입돼요',
+    [ENTRY_STATE_SEARCH]: '검색층으로 내렸어요 (이 항목만 벡터에 넣었어요)',
+    [ENTRY_STATE_OFF]: '이 항목을 껐어요 — 표에 회색으로 남으니 한 번 더 누르면 되돌아와요',
+});
+
+function buildStateToggle(world, uid, state, $panel) {
     const $btn = $('<span class="jev-core-toggle" role="button" tabindex="0">')
-        .addClass(isCore ? 'jev-is-core' : 'jev-is-search')
-        .attr('title', isCore
-            ? '상시 메모리(코어) — 누르면 검색층으로 내려요'
-            : '검색층 메모리 — 누르면 상시(코어)로 올려요')
+        .addClass(ENTRY_STATE_CLASS[state] ?? 'jev-is-search')
+        .attr('title', ENTRY_STATE_TITLE[state] ?? '')
         .append($('<i class="fa-solid fa-circle">'));
 
     const run = async () => {
         if ($btn.hasClass('disabled')) return;
         $btn.addClass('disabled');
         try {
-            await setEntryCore(world, uid, !isCore);
-            toastr.success(
-                !isCore ? '상시 메모리로 올렸어요 (order 1000)' : '검색층으로 내렸어요 (벡터 삽입 완료)',
-                'Jev Lorebook');
+            const plan = await cycleEntryState(world, uid);
+            toastr.success(ENTRY_STATE_DONE_TOAST[plan.to] ?? '상태를 바꿨어요', 'Jev Lorebook');
             await renderPanelChunks($panel);
             renderPanelSummary($panel);
         } catch (error) {
@@ -948,28 +1085,43 @@ function buildForceEntry(a) {
 }
 
 /**
- * 🎲 랜덤 주입 후보 뽑기 (v0.15.0).
+ * 🎲 쿨다운 링버퍼 크기 — 순수 함수(단위검증 대상). v0.17.0에서 하한을 완화했다.
+ *
+ * 구 공식 `max(5, floor(n/3))`은 항목이 적은 북에서 하한 5가 풀 거의 전체를 덮어
+ * "방금 뽑힌 것 빼면 남는 게 없음" 상태를 만들었다(풀 6 → 쿨다운 5 → 가용 1).
+ * 하한을 '풀의 절반까지'로 조인다 → 풀 6 = 3 · 풀 20 = 6 · 풀 50 = 16.
+ * 풀 0·1에서는 0이 나온다 — 호출부는 `slice(-0)`이 배열 전체를 돌려주는 함정을 따로 막아야 한다.
+ */
+function randomCooldownSize(poolSize) {
+    const n = Math.max(0, Math.floor(Number(poolSize) || 0));
+    return Math.max(Math.min(5, Math.floor(n / 2)), Math.floor(n / 3));
+}
+
+/**
+ * 🎲 랜덤 주입 후보 뽑기 (v0.15.0 · v0.17.0에서 북별 루프로 전환).
  *
  * 발주 의도: 장면 유사성이 있는 부분에서만 나와서 의외의 내용이 영영 안 나오는 걸 막는 장치.
  * 그래서 **벡터 검색도 Jev 판정도 거치지 않는다** — 색인이 안 된 로어북도 후보에 들어간다.
  *
+ * v0.17.0 — 통합 풀 하나를 북별 루프로 갈랐다. 북마다 따로 쓰는 것 셋:
+ *   ① 랜덤 켜기(북별 유효값) ② 예산(북별 유효값) ③ 쿨다운 링버퍼(recentRandomUids의 world 키)
+ *
  * 제외: constant(코어 — ST가 매턴 네이티브 주입) / disable / 본문 빈 것 /
- *       이번 턴 Jev 채택분(excludeKeys — 중복 주입 방지) / 쿨다운 중인 uid.
- * 예산은 randomBudgetTokens 단독이라 Jev 채택분의 예산 컷에 일절 영향을 주지 않는다.
+ *       이번 턴 Jev 채택분(excludeKeys — 중복 주입 방지) / 그 북에서 쿨다운 중인 uid.
  * 한 항목이 남은 예산을 넘으면 건너뛰고 다음 후보를 본다(자투리 활용 — Jev 컷과 같은 규칙).
  * 담을 게 없으면 0개로 조용히 끝낸다. 토스트는 띄우지 않는다.
  *
  * @param {string[]} worlds 대상 로어북 이름 (getTargetWorlds — 4계층 전부)
  * @param {Set<string>} excludeKeys 제외할 `${world}.${uid}`
- * @returns {Promise<Array>} 뽑힌 항목
+ * @returns {Promise<Array>} 북별 결과를 합친 것
  */
 async function pickRandomEntries(worlds, excludeKeys) {
-    if (getSettings().randomEnabled !== true) return [];
-    const budget = getRandomBudget();
-    if (budget <= 0) return [];
-
-    const pool = [];
+    const picked = [];
     for (const world of worlds) {
+        if (!isRandomEnabled(world)) continue; // 북별 켜기 — 전역이 켜져 있어도 이 북만 끌 수 있다
+        const budget = getRandomBudget(world);
+        if (budget <= 0) continue;
+
         let worldData;
         try {
             worldData = await loadWorldInfo(world);
@@ -977,6 +1129,8 @@ async function pickRandomEntries(worlds, excludeKeys) {
             console.log(`${LOG} 🎲 '${world}' 읽기 실패 — 이 로어북만 건너뜀: ${error?.message ?? error}`);
             continue;
         }
+
+        const pool = [];
         for (const entry of Object.values(worldData?.entries ?? {})) {
             if (!entry || entry.disable || entry.constant) continue;
             const text = String(entry.content ?? '').trim();
@@ -985,44 +1139,46 @@ async function pickRandomEntries(worlds, excludeKeys) {
             if (excludeKeys.has(key)) continue;
             pool.push({ world, uid: entry.uid, key, text, title: String(entry.comment || `uid ${entry.uid}`), raw: entry });
         }
-    }
-    if (!pool.length) return [];
+        if (!pool.length) continue;
 
-    // 쿨다운 — 링버퍼 크기는 풀 크기에 비례. 쿨다운 때문에 후보가 0이 되면 무시하고 다시 뽑는다(항목 적은 로어북 보호).
-    const cooldownSize = Math.max(5, Math.floor(pool.length / 3));
-    const cooled = new Set(recentRandomUids);
-    let avail = pool.filter(p => !cooled.has(p.key));
-    const cooledOut = pool.length - avail.length;
-    let cooldownIgnored = false;
-    if (!avail.length) {
-        avail = pool.slice();
-        cooldownIgnored = true;
-    }
+        // 쿨다운 때문에 후보가 0이 되면 무시하고 다시 뽑는다(항목 적은 로어북 보호)
+        const cooldownSize = randomCooldownSize(pool.length);
+        const ring = recentRandomUids.get(world) ?? [];
+        const cooled = new Set(ring);
+        let avail = pool.filter(p => !cooled.has(p.key));
+        const cooledOut = pool.length - avail.length;
+        let cooldownIgnored = false;
+        if (!avail.length) {
+            avail = pool.slice();
+            cooldownIgnored = true;
+        }
 
-    // Fisher-Yates 셔플
-    for (let i = avail.length - 1; i > 0; i--) {
-        const k = Math.floor(Math.random() * (i + 1));
-        [avail[i], avail[k]] = [avail[k], avail[i]];
-    }
+        // Fisher-Yates 셔플
+        for (let i = avail.length - 1; i > 0; i--) {
+            const k = Math.floor(Math.random() * (i + 1));
+            [avail[i], avail[k]] = [avail[k], avail[i]];
+        }
 
-    const picked = [];
-    let used = 0;
-    for (const cand of avail) {
-        if (used >= budget) break;
-        const tokens = await getTokenCountAsync(cand.text);
-        if (used + tokens > budget) continue; // 남은 예산에 드는 다음 후보 탐색
-        used += tokens;
-        picked.push({ ...cand, tokens });
-    }
-    if (!picked.length) {
-        console.log(`${LOG} 🎲 랜덤 0건 — 풀 ${pool.length}개 / 쿨다운 제외 ${cooledOut}개 / 예산 ${budget}토큰에 드는 항목 없음`);
-        return [];
-    }
+        const worldPicked = [];
+        let used = 0;
+        for (const cand of avail) {
+            if (used >= budget) break;
+            const tokens = await getTokenCountAsync(cand.text);
+            if (used + tokens > budget) continue; // 남은 예산에 드는 다음 후보 탐색
+            used += tokens;
+            worldPicked.push({ ...cand, tokens });
+        }
+        if (!worldPicked.length) {
+            console.log(`${LOG} 🎲 '${world}' 0건 — 풀 ${pool.length}개 / 쿨다운 제외 ${cooledOut}개 / 예산 ${budget}토큰에 드는 항목 없음`);
+            continue;
+        }
 
-    recentRandomUids.push(...picked.map(p => p.key));
-    if (recentRandomUids.length > cooldownSize) recentRandomUids = recentRandomUids.slice(-cooldownSize);
-
-    console.log(`${LOG} 🎲 랜덤 ${picked.length}건 · ${used}/${budget}토큰 · 풀 ${pool.length}개 · 쿨다운 제외 ${cooledOut}개${cooldownIgnored ? '(무시함)' : ''} · 링버퍼 ${recentRandomUids.length}/${cooldownSize} · [${picked.map(p => `${p.world}#${p.uid}`).join(', ')}]`);
+        // ⚠ cooldownSize가 0이면 slice(-0)이 배열 '전체'를 돌려준다 — 링버퍼가 무한히 자란다. 0은 따로 막는다.
+        const nextRing = [...ring, ...worldPicked.map(p => p.key)];
+        recentRandomUids.set(world, cooldownSize > 0 ? nextRing.slice(-cooldownSize) : []);
+        console.log(`${LOG} 🎲 '${world}' ${worldPicked.length}건 · ${used}/${budget}토큰 · 풀 ${pool.length}개 · 쿨다운 제외 ${cooledOut}개${cooldownIgnored ? '(무시함)' : ''} · 링버퍼 ${(recentRandomUids.get(world) ?? []).length}/${cooldownSize} · [${worldPicked.map(p => `#${p.uid}`).join(', ')}]`);
+        picked.push(...worldPicked);
+    }
     return picked;
 }
 
@@ -1034,7 +1190,7 @@ function rememberRandomPicks(picks) {
 
 /** 채팅이 바뀌면 쿨다운·직전 선택을 비운다 — 다른 채팅의 이력이 남으면 새 채팅 첫 턴이 편향된다 */
 function resetRandomCooldown() {
-    recentRandomUids = [];
+    recentRandomUids = new Map();
     lastRandomItems = [];
     lastRandomKeys = new Set();
 }
@@ -1095,7 +1251,7 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
         for (const world of worlds) {
             let metadata;
             try {
-                ({ metadata } = await vectorQuery(world, queryText, getQueryTopK()));
+                ({ metadata } = await vectorQuery(world, queryText, getQueryTopK(world)));
             } catch (error) {
                 console.log(`${LOG} '${world}' 회수 실패(색인 안 됨?) — 이 로어북만 건너뜀: ${error?.message ?? error}`);
                 continue;
@@ -1137,21 +1293,35 @@ async function jevLorebookInterceptor(chat, _contextSize, _abort, type) {
             return { ...c, ...scores, final: finalScore(scores) };
         }));
 
-        // 3. 점수순 정렬 → 예산 컷
-        const budget = Number(settings.budgetTokens) || defaultSettings.budgetTokens;
-        const ranked = judged.slice().sort((a, b) => b.final - a.final);
+        // 3. 북별 점수순 정렬 → 북별 예산 컷 (v0.17.0)
+        // v0.16.0까지는 전역 예산 1벌로 전 북을 한 줄에 세워 잘랐다. 그러면 큰 북이 예산을 먼저 다 먹고
+        // 작은 북은 점수가 높아도 한 건도 못 들어간다 — 예산·topK를 북별로 덮어쓰려면 컷도 북별이어야 한다.
+        // 회수(vectorQuery)는 v0.8.0부터 이미 북별 루프였다(위 1단계) — 이번에 바뀐 건 예산 컷 쪽뿐이다.
+        // ⚠ 실효 총예산 = 북별 유효 예산의 '합'이다. 북이 3개면 전역 기본 4,000에서 최대 12,000까지 쓴다.
+        //   팝업 A의 「주입 예산 합계」 한 줄이 그 합을 그대로 보여준다.
         const adopted = [];
+        const ranked = [];
+        const budgetByWorld = new Map();
         let usedTokens = 0;
-        for (const item of ranked) {
-            if (item.final < SCORE_FLOOR) break; // 정렬됐으니 이후는 전부 하한 미만
-            // v0.9.4 — 개수 상한을 없앰다. 컷은 SCORE_FLOOR와 budgetTokens 둘뿐이다.
-            // v0.9.0에서 3개로 조였던 근거("Jev 몫을 줄여야 ST 총예산이 안 터진다")는
-            // 틀린 전제였다 — v0.9.3 전까지 Jev 주입은 실효 0이라 부하를 겪어본 적이 없다.
-            // 발주자 확정(2026-09-20): 키워드 발동과 별개로 Jev는 설정 상한 토큰까지 다 채운다.
-            const tokens = await getTokenCountAsync(item.text);
-            if (usedTokens + tokens > budget) continue; // 남은 예산에 드는 다음 후보 탐색
-            usedTokens += tokens;
-            adopted.push({ ...item, tokens });
+        for (const world of worlds) {
+            const budget = getBudgetTokens(world);
+            budgetByWorld.set(world, budget);
+            const worldRanked = judged.filter(j => j.world === world).sort((a, b) => b.final - a.final);
+            let used = 0;
+            let worldAdopted = 0;
+            for (const item of worldRanked) {
+                if (item.final < SCORE_FLOOR) break; // 정렬됐으니 이후는 전부 하한 미만
+                // v0.9.4 — 개수 상한은 없다. 컷은 SCORE_FLOOR와 예산 둘뿐이다.
+                // 발주자 확정(2026-09-20): 키워드 발동과 별개로 Jev는 설정 상한 토큰까지 다 채운다.
+                const tokens = await getTokenCountAsync(item.text);
+                if (used + tokens > budget) continue; // 남은 예산에 드는 다음 후보 탐색
+                used += tokens;
+                worldAdopted++;
+                adopted.push({ ...item, tokens });
+            }
+            usedTokens += used;
+            ranked.push(...worldRanked);
+            console.log(`${LOG} '${world}' 예산 컷 — 후보 ${worldRanked.length} → 채택 ${worldAdopted} / ${used}/${budget}토큰`);
         }
 
         lastJudgment = { key: cacheKey, items: adopted.map(a => ({ world: a.world, uid: a.uid, raw: a.raw })), ts: Date.now() };
@@ -1441,12 +1611,16 @@ function parseConversionOutput(text) {
 }
 
 /**
- * 코어 규칙/일기 탐색 (v0.13.0). 전부 constant===true && !disable을 조건에 넣는다 —
- * 그래야 🔵🟢 수동 강등(setEntryCore)이 이 항목을 자동 갱신·슬라이딩 대상에서 확실히 빼낸다.
- * (comment만 보고 판단했다면 수동으로 검색층에 내린 옛 일기를 다음 변환이 다시 '열린 일기'로 오인할 수 있었다.)
+ * 코어 규칙/일기 탐색 (v0.13.0 · v0.17.0 수정). 조건은 `constant === true` + comment 형식, 둘뿐이다.
+ *
+ * v0.16.0까지는 `!e.disable`도 조건이었다 — 그래서 ⭐ Core Rules를 끄면 다음 변환이 '규칙 없음'으로 판단해
+ * **새 규칙 항목을 또 만들었다.** 나중에 되살리면 코어가 2개가 되고 둘 다 constant라 매 턴 둘 다 주입된다.
+ * v0.17.0부터 꺼진 코어도 찾아서 갱신 대상으로 **재사용**한다. 단 `disable`은 어느 경로에서도 건드리지 않는다 —
+ * 사용자가 끈 의도를 존중해 '갱신은 되고 꺼진 채 남는다'가 계약이다.
+ * (constant를 조건에 남기는 이유는 그대로다: 🔵🟢으로 검색층에 내린 옛 일기를 다음 변환이 '열린 일기'로 오인하면 안 된다.)
  */
 function findCoreRulesEntry(worldData) {
-    return Object.values(worldData?.entries ?? {}).find(e => e.constant && !e.disable && e.comment === CORE_RULES_COMMENT) ?? null;
+    return Object.values(worldData?.entries ?? {}).find(e => e.constant && e.comment === CORE_RULES_COMMENT) ?? null;
 }
 
 const CORE_DIARY_COMMENT_RE = /^⭐ Core Diary(?:\s*\(sealed\))?\s*·\s*(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})\s*$/;
@@ -1475,10 +1649,14 @@ function stripDiaryHeader(content) {
     }
     return String(content ?? '').trim();
 }
-/** 로어북의 코어 일기 전부 — 오래된→최신 정렬 (constant===true인 것만, 강등된 건 안 잡힘) */
+/**
+ * 로어북의 코어 일기 전부 — 오래된→최신 정렬. constant===true인 것만(강등된 건 안 잡힘).
+ * v0.17.0: `!e.disable`을 뗐다 — 꺼진 일기를 못 찾으면 다음 변환이 새 일기를 또 열어 코어가 중복된다.
+ * 꺼진 일기도 갱신·슬라이딩(봉인/강등) 대상에 들어가되, `disable` 자체는 건드리지 않는다.
+ */
 function findCoreDiaryEntries(worldData) {
     return Object.values(worldData?.entries ?? {})
-        .filter(e => e.constant && !e.disable && parseDiaryComment(e.comment))
+        .filter(e => e.constant && parseDiaryComment(e.comment))
         .sort((a, b) => parseDiaryComment(a.comment).start.localeCompare(parseDiaryComment(b.comment).start));
 }
 /** 레거시 통짜 코어(마이그레이션 입력용) — archived 표시된 것은 comment가 달라져 자동으로 제외된다 */
@@ -1881,11 +2059,13 @@ async function convertChatToLorebook(setStatus) {
             console.log(`${LOG} 레거시 '${LEGACY_CORE_COMMENT}' 감지 — 규칙/일기 양쪽 입력으로 공급해 마이그레이션한다`);
         }
         // 되돌리기 스냅샷용 — 이번 실행이 건드리기 전의 규칙/일기 전량을 그대로 잡아둔다 (덮어쓰거나 강등해도 전부 복원 가능하게)
+        // v0.17.0 — 스냅샷에 disable을 추가했다. 3버튼(🔵🟢⚫) 도입 후 이 필드가 빠지면
+        // 되돌리기가 사용자가 만든 '꺼짐' 상태를 말없이 뭉갠다(복원 대상 항목이 전부 켜진 채로 살아난다).
         const prevCoreRulesSnap = rulesEntryBefore
-            ? { uid: rulesEntryBefore.uid, existed: true, content: String(rulesEntryBefore.content ?? '') }
-            : { uid: null, existed: false, content: '' };
+            ? { uid: rulesEntryBefore.uid, existed: true, content: String(rulesEntryBefore.content ?? ''), disable: rulesEntryBefore.disable === true }
+            : { uid: null, existed: false, content: '', disable: false };
         const prevCoreDiariesSnap = diaryEntriesBefore.map(e => ({
-            uid: e.uid, comment: e.comment, content: String(e.content ?? ''), constant: e.constant, order: e.order,
+            uid: e.uid, comment: e.comment, content: String(e.content ?? ''), constant: e.constant, order: e.order, disable: e.disable === true,
         }));
         const anchor = resolveStoryAnchor(ctx, worldData, fresh);
 
@@ -2020,18 +2200,20 @@ async function convertChatToLorebook(setStatus) {
                 console.warn(`${LOG} 코어 규칙 ${rulesTokens}토큰 — 상한 ${CORE_RULES_TOKEN_LIMIT} 초과 (자르지 않고 그대로 저장)`);
             }
             let rulesEntry = findCoreRulesEntry(worldData);
-            if (!rulesEntry) {
+            const rulesIsNew = !rulesEntry;
+            if (rulesIsNew) {
                 rulesEntry = createWorldInfoEntry(world, worldData);
                 if (!rulesEntry) throw new Error('코어 규칙 항목 uid 할당 실패');
                 rulesEntry.comment = CORE_RULES_COMMENT;
+                // v0.17.0 — disable 초기화는 '신규 생성'에서만 한다. 기존 항목이 꺼져 있으면 그건 사용자가 끈 것이다.
+                rulesEntry.disable = false;
                 addedUids.push(rulesEntry.uid); // 되돌리기 — 이번 실행이 새로 만든 것이면 통째로 지운다
             }
             rulesEntry.key = [];
             rulesEntry.order = CORE_RULES_ORDER;
             rulesEntry.content = rulesResult.body;
             rulesEntry.constant = true;
-            rulesEntry.disable = false;
-            rulesUpdatedNote = `갱신(${rulesTokens}토큰)`;
+            rulesUpdatedNote = `갱신(${rulesTokens}토큰)${rulesEntry.disable ? ' · 꺼진 채 유지' : ''}`;
             console.log(`${LOG} 코어 규칙 upsert — ${rulesTokens}토큰 (constant, 매턴 네이티브 주입)`);
         } else {
             console.warn(`${LOG} 코어 규칙 미갱신 — 기존 항목을 그대로 둔다`);
@@ -2050,14 +2232,15 @@ async function convertChatToLorebook(setStatus) {
             if (!diaryEntry) {
                 diaryEntry = createWorldInfoEntry(world, worldData);
                 if (!diaryEntry) throw new Error('코어 일기 항목 uid 할당 실패');
+                // v0.17.0 — disable 초기화는 '신규로 일기를 여는' 경로에서만. 기존 일기의 꺼짐은 사용자 의도다.
+                diaryEntry.disable = false;
                 addedUids.push(diaryEntry.uid); // 되돌리기 — 이번 실행이 새로 연 일기면 통째로 지운다
             }
             diaryEntry.key = [];
             diaryEntry.comment = buildDiaryComment(diaryStart, diaryEnd, sealNow);
             diaryEntry.content = diaryContent;
             diaryEntry.constant = true;
-            diaryEntry.disable = false;
-            diaryUpdatedNote = `갱신(${diaryTokens}토큰${sealNow ? ' · 봉인' : ''})`;
+            diaryUpdatedNote = `갱신(${diaryTokens}토큰${sealNow ? ' · 봉인' : ''})${diaryEntry.disable ? ' · 꺼진 채 유지' : ''}`;
             console.log(`${LOG} 코어 일기 upsert — '${diaryEntry.comment}' ${diaryTokens}토큰${sealNow ? ' (600토큰 초과 — 봉인, 다음 변환부터 새 일기)' : ''}`);
 
             // 개수 상한(3개) 초과분 강등 — 봉인으로 새로 닫혔든, 이미 꽉 찬 상태에서 새로 열었든 매번 확인한다.
@@ -2479,6 +2662,8 @@ async function undoLastConversion(setStatus) {
             const entry = worldData.entries?.[String(snap.prevCoreRules.uid)];
             if (entry) {
                 entry.content = snap.prevCoreRules.content;
+                // v0.17.0 — 꺼짐 상태까지 되돌린다. v0.16.0 이전 스냅샷엔 이 필드가 없으니 있을 때만 건드린다.
+                if (snap.prevCoreRules.disable !== undefined) entry.disable = snap.prevCoreRules.disable === true;
                 rulesNote = '규칙 본문 복원';
             } else {
                 rulesNote = '규칙 항목을 찾지 못해 복원 안 됨';
@@ -2516,6 +2701,8 @@ async function undoLastConversion(setStatus) {
             entry.content = d.content;
             entry.constant = d.constant;
             entry.order = d.order;
+            // v0.17.0 — 꺼짐 상태까지 되돌린다. v0.16.0 이전 스냅샷엔 이 필드가 없으니 있을 때만 건드린다.
+            if (d.disable !== undefined) entry.disable = d.disable === true;
             restored++;
         }
         if (deletedNew || restored) {
@@ -2582,7 +2769,11 @@ function renderPanelSummary($panel) {
     $summary.append(row('대상 로어북', detailed.length
         ? `${detailed.length}개 — ` + detailed.map(d => `${d.name} (${LAYER_LABELS[d.layer] ?? d.layer})`).join(', ')
         : '없음 (채팅·캐릭터·전역·페르소나 어디에도 연결된 로어북이 없어요)'));
-    $summary.append(row('턴당 예산', `${Number(settings.budgetTokens) || defaultSettings.budgetTokens}토큰`));
+    // 북별 오버라이드가 있으면 실효 총예산은 '북별 유효값의 합'이다 — 전역값만 띄우면 이 줄이 거짓말한다 (v0.17.0)
+    const budgetSum = worlds.reduce((sum, name) => sum + getBudgetTokens(name), 0);
+    $summary.append(row('턴당 예산', worlds.length
+        ? `북별 합계 ${budgetSum.toLocaleString()}토큰 (전역 기본 ${getBudgetTokens().toLocaleString()})`
+        : `${getBudgetTokens().toLocaleString()}토큰 (전역 기본)`));
     $summary.append(row('전송', jevTransport ? jevTransport.label : (lastTransportError ? `없음 — ${lastTransportError}` : '미감지 (첫 생성 때 자동으로 감지해요)')));
     const embedMeta = EMBEDDING_SOURCES[settings.embeddingSource] ?? EMBEDDING_SOURCES.palm;
     const embedModel = embedMeta.modelFromRequest ? (String(settings.embeddingModel || '').trim() || embedMeta.defaultModel) : '(서버 고정)';
@@ -2763,13 +2954,18 @@ async function renderPanelChunks($panel) {
         }
         const allEntries = Object.values(worldData?.entries ?? {});
         // 코어(constant) 항목은 색인·판정 밖 — 별도 섹션으로 표시. v0.13.0: 규칙/일기/기타(수동 승격)로 다시 나눈다.
-        const coreEntries = allEntries.filter(e => e.constant && !e.disable && String(e.content ?? '').trim());
+        // v0.17.0 — 꺼진 항목(disable)을 **두 표 모두에 회색 행으로 남긴다.** 안 남기면 어느 표에도 안 나와서
+        // 확장 안에서 되살릴 방법이 없다(동그라미 버튼이 유일한 복귀 경로다).
+        // 대신 색인 대조·합계 토큰에서는 반드시 뺀다 — 매 턴 주입되지 않는 것을 세면 그 줄이 거짓말한다.
+        const coreEntries = allEntries.filter(e => e.constant && String(e.content ?? '').trim());
         const coreRules = coreEntries.filter(e => e.comment === CORE_RULES_COMMENT);
         const coreDiaries = coreEntries.filter(e => parseDiaryComment(e.comment))
             .sort((a, b) => parseDiaryComment(a.comment).start.localeCompare(parseDiaryComment(b.comment).start));
         const coreOther = coreEntries.filter(e => e.comment !== CORE_RULES_COMMENT && !parseDiaryComment(e.comment));
-        const entries = allEntries.filter(e => !e.disable && !e.constant && String(e.content ?? '').trim());
-        const disabledCount = allEntries.length - entries.length - coreEntries.length;
+        const entries = allEntries.filter(e => !e.constant && String(e.content ?? '').trim());
+        const liveEntries = entries.filter(e => !e.disable);           // 집계·색인 대조 기준 = 켜진 것만
+        const offEntries = entries.length - liveEntries.length;        // 회색 행으로 표에 남는다
+        const emptyCount = allEntries.length - entries.length - coreEntries.length; // 본문이 비어 표에서 빠진 것
 
         let indexedCount = 0;
         const $table = $('<table class="jev-panel-table">');
@@ -2783,15 +2979,19 @@ async function renderPanelChunks($panel) {
         const $tbody = $('<tbody>');
         for (const e of entries) {
             const content = String(e.content ?? '');
+            const isOff = getEntryState(e) === ENTRY_STATE_OFF;
             const hash = getStringHash(content);
             const isIndexed = indexedHashes ? indexedHashes.has(Number(hash)) : false;
-            if (isIndexed) indexedCount++;
-            const $tr = $('<tr>').toggleClass('jev-missing', indexedHashes ? !isIndexed : false);
-            $tr.append($('<td>').text(indexedHashes ? (isIndexed ? '✓' : '✗') : '?'));
+            if (isIndexed && !isOff) indexedCount++;
+            // 꺼진 항목의 색인 칸은 '—'다. 벡터엔 남아 있어도 주입 대상이 아니라 ✓를 찍으면 거짓말이 된다.
+            const $tr = $('<tr>')
+                .toggleClass('jev-row-off', isOff)
+                .toggleClass('jev-missing', (!isOff && indexedHashes) ? !isIndexed : false);
+            $tr.append($('<td>').text(isOff ? '—' : (indexedHashes ? (isIndexed ? '✓' : '✗') : '?')));
             $tr.append($('<td>').text(e.uid));
             $tr.append($('<td class="jev-cell-title">').text(String(e.comment || `uid ${e.uid}`).slice(0, 48)));
             $tr.append($('<td>').text(approxTokens(content)));
-            $tr.append(buildCoreToggle(world, e.uid, false, $panel));
+            $tr.append(buildStateToggle(world, e.uid, getEntryState(e), $panel));
 
             const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid });
             $tr.append($cell);
@@ -2800,28 +3000,35 @@ async function renderPanelChunks($panel) {
         $table.append($tbody);
 
         const headline = listError
-            ? `${world} — 항목 ${entries.length}개 / 색인 대조에 실패했어요: ${listError}`
-            : `${world} — 항목 ${entries.length}개 / 색인 ${indexedCount}개 / 미색인 ${entries.length - indexedCount}개`
+            ? `${world} — 항목 ${liveEntries.length}개 / 색인 대조에 실패했어요: ${listError}`
+            : `${world} — 항목 ${liveEntries.length}개 / 색인 ${indexedCount}개 / 미색인 ${liveEntries.length - indexedCount}개`
               + (indexedHashes ? ` (벡터 저장소 ${indexedHashes.size}건)` : '')
-              + (disabledCount ? ` · 비활성/빈 항목 ${disabledCount}개 제외` : '');
+              + (offEntries ? ` · 꺼진 항목 ${offEntries}개 (회색 행)` : '')
+              + (emptyCount ? ` · 본문 빈 항목 ${emptyCount}개 제외` : '');
         const $worldTitle = $('<div class="jev-panel-world-title">');
         const layer = layerOf.get(world);
         if (layer) $worldTitle.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
         $worldTitle.append($('<span>').text(headline));
         $section.append($worldTitle);
         $section.append($('<div class="jev-panel-muted">').text(
-            '🔵 = 상시 메모리(매 턴 주입) · 🟢 = 검색층 / 누르면 전환할 수 있습니다.'));
+            '동그라미를 누르면 🔵 상시 메모리(매 턴 주입) → 🟢 검색층 → ⚫ 꺼짐 순서로 바뀌어요. '
+            + '⚫에서 한 번 더 누르면 원래 색으로 돌아와요.'));
 
         // 코어 섹션 — constant라 ST가 매턴 네이티브 주입, Jev 판정·벡터 색인 제외.
         // v0.13.0: 규칙(최대 1) · 일기(최대 3, 오래된→최신, 봉인/열림 배지) · 기타(수동 승격분)를 구분 표시한다.
         if (coreEntries.length) {
-            const coreTokens = coreEntries.reduce((sum, e) => sum + approxTokens(e.content), 0);
-            const budget = Number(getSettings().budgetTokens) || defaultSettings.budgetTokens;
+            // ⚠ 합계 토큰에서 꺼진 파랑은 뺀다 (v0.17.0) — 매 턴 주입되지 않는 걸 합계에 넣으면 이 줄이 거짓말한다.
+            const coreLive = coreEntries.filter(e => !e.disable);
+            const coreOffCount = coreEntries.length - coreLive.length;
+            const coreTokens = coreLive.reduce((sum, e) => sum + approxTokens(e.content), 0);
+            const liveOtherCount = coreOther.filter(e => !e.disable).length;
+            const budget = getBudgetTokens(world); // 북별 유효 예산 (오버라이드 반영)
             const $core = $('<div class="jev-panel-core">');
             $core.append($('<div class="jev-panel-core-title">').text(
-                `⭐ 코어 ${coreEntries.length}개 (규칙 ${coreRules.length} · 일기 ${coreDiaries.length}${coreOther.length ? ` · 기타 ${coreOther.length}` : ''}) `
+                `⭐ 코어 ${coreLive.length}개 (규칙 ${coreRules.filter(e => !e.disable).length} · 일기 ${coreDiaries.filter(e => !e.disable).length}${liveOtherCount ? ` · 기타 ${liveOtherCount}` : ''})`
+                + `${coreOffCount ? ` · 꺼짐 ${coreOffCount}개(합계 제외)` : ''} `
                 + `· 합계 ≈${coreTokens.toLocaleString()}토큰 · 주입 예산 ${budget.toLocaleString()} → 매 턴 ≈${(coreTokens + budget).toLocaleString()}토큰`));
-            $core.append($('<div class="jev-panel-muted">').text('매 턴 항상 주입돼요 (constant, Jev 판정을 거치지 않아요)'));
+            $core.append($('<div class="jev-panel-muted">').text('매 턴 항상 주입돼요 (constant, Jev 판정을 거치지 않아요). 회색 행은 꺼진 항목이라 주입되지 않아요.'));
 
             const $coreTable = $('<table class="jev-panel-table">');
             const $coreHead = $('<tr>');
@@ -2838,12 +3045,13 @@ async function renderPanelChunks($panel) {
             ];
             for (const { e, kind } of coreRows) {
                 const content = String(e.content ?? '');
-                const $tr = $('<tr>');
-                $tr.append($('<td>').text(kind));
+                const isOff = getEntryState(e) === ENTRY_STATE_OFF;
+                const $tr = $('<tr>').toggleClass('jev-row-off', isOff);
+                $tr.append($('<td>').text(isOff ? (kind ? `${kind} · 꺼짐` : '꺼짐') : kind));
                 $tr.append($('<td>').text(e.uid));
                 $tr.append($('<td class="jev-cell-title">').text(String(e.comment || `uid ${e.uid}`).slice(0, 48)));
                 $tr.append($('<td>').text(approxTokens(content)));
-                $tr.append(buildCoreToggle(world, e.uid, true, $panel));
+                $tr.append(buildStateToggle(world, e.uid, getEntryState(e), $panel));
 
                 const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid });
                 $tr.append($cell);
@@ -3144,7 +3352,7 @@ async function openDetailPanel() {
         const settings = getSettings();
         settings.keepRecent = Math.floor(value);
         saveSettingsDebounced();
-        $('#jev_lorebook_keep_recent').val(settings.keepRecent); // 설정탭이 열려 있을 수 있다
+        $('#jev_lorebook_keep_recent').val(settings.keepRecent); // 팝업 B(로어북 만들기 설정)가 열려 있을 수 있다
         clearTimeout(keepRecentTimer);
         keepRecentTimer = setTimeout(() => renderPanelSummary($panel), 250); // 연타 시 렌더가 겹치지 않게
     });
@@ -3269,12 +3477,12 @@ function updateEmbeddingSourceUi() {
 }
 
 /** 변환 프로필 셀렉트 채우기 — connection-manager 비활성이면 행 숨김(현재 연결된 메인 API로 동작) */
-function populateConvertProfiles() {
+function populateConvertProfiles($root = $(document)) {
     const settings = getSettings();
-    const $row = $('#jev_lorebook_profile_row');
+    const $row = $root.find('#jev_lorebook_profile_row');
     try {
         const profiles = ConnectionManagerRequestService.getSupportedProfiles(); // shared.js:525
-        const $select = $('#jev_lorebook_convert_profile');
+        const $select = $root.find('#jev_lorebook_convert_profile');
         $select.empty().append($('<option>').val('').text('— 현재 연결된 메인 API —'));
         for (const p of profiles) {
             $select.append($('<option>').val(p.id).text(p.name || p.id));
@@ -3292,8 +3500,8 @@ function populateConvertProfiles() {
  * "30이 많은 건가 적은 건가"는 로어북 크기를 같이 봐야 판단된다.
  * 로어북 로드가 있어 비동기 — 렌더를 막지 않는다 (fillStackTokens과 같은 패턴).
  */
-async function fillTopKTotal() {
-    const $total = $('#jev_lorebook_topk_total');
+async function fillTopKTotal($root = $(document)) {
+    const $total = $root.find('#jev_lorebook_topk_total');
     if (!$total.length) return;
     const worlds = getTargetWorlds();
     if (!worlds.length) {
@@ -3315,14 +3523,19 @@ async function fillTopKTotal() {
 }
 
 /**
- * 설정탭 '대상 로어북' — 지금 감지된 북 목록 (v0.8.0).
- * 후보 수 상한은 두지 않기로 했으므로(발주자 결정) 대신 북 개수·총 항목 수를 보여준다.
- * 로어북 로드·색인 대조가 있어 비동기 — fillTopKTotal과 같은 패턴으로 렌더를 막지 않는다.
+ * 감지 목록 — 지금 감지된 북 목록 (v0.8.0 · v0.17.0에서 팝업 A로 이전 + 행 강화).
+ *
+ * 행마다 동기로 먼저 그리는 것: 층 배지 · 북 이름 · [설정 있음] 배지 · [톱니] 버튼.
+ * 비동기로 뒤에 채우는 것: 항목수 · 색인 ✓/✗ N/M · 랜덤 후보 N개 · 쿨다운 N.
+ * 톱니를 async 뒤로 미루면 로어북 읽기가 느린 환경에서 버튼이 한참 안 뜬다 — 먼저 그린다.
+ * 로어북 로드·색인 대조가 있어 비동기 — 렌더를 막지 않는다(fillStackTokens과 같은 패턴).
+ *
+ * @param {*} [$root] 검색 기준. 팝업을 열 때는 아직 DOM에 안 붙은 $popup을 넘긴다.
  */
 let layerListRun = 0;
-async function renderLayerList() {
+async function renderLayerList($root = $(document)) {
     const run = ++layerListRun;
-    const $box = $('#jev_lorebook_layer_list');
+    const $box = $root.find('#jev_lorebook_layer_list');
     if (!$box.length) return;
     const detailed = getTargetWorldsDetailed();
     $box.empty();
@@ -3338,6 +3551,17 @@ async function renderLayerList() {
         const $row = $('<div class="jev-layer-row">');
         $row.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
         $row.append($('<span class="jev-layer-name">').text(name));
+        if (hasWorldOverride(name)) {
+            $row.append($('<span class="jev-layer-badge jev-override-badge">').text('설정 있음'));
+        }
+        const openWorld = () => void openWorldSettingsPopup(name);
+        $row.append($('<span class="jev-layer-gear" role="button" tabindex="0">')
+            .attr('title', '이 로어북만의 주입 예산·랜덤·회수 후보 수를 정해요')
+            .append($('<i class="fa-solid fa-gear">'))
+            .on('click', openWorld)
+            .on('keydown', (ev) => {
+                if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openWorld(); }
+            }));
         const $meta = $('<span class="jev-layer-meta">').text('확인 중…');
         $row.append($meta);
         $box.append($row);
@@ -3348,7 +3572,7 @@ async function renderLayerList() {
             const live = Object.values(worldData?.entries ?? {})
                 .filter(e => !e.disable && String(e.content ?? '').trim());
             totalEntries += live.length;
-            // 코어(constant)는 ST가 매 턴 네이티브 주입 = 색인 대상이 아니다
+            // 코어(constant)는 ST가 매 턴 네이티브 주입 = 색인 대상도, 랜덤 후보도 아니다 → 두 숫자의 모집단이 같다
             const indexTargets = live.filter(e => !e.constant);
             let indexText = '색인 확인 실패';
             try {
@@ -3361,7 +3585,11 @@ async function renderLayerList() {
             } catch (error) {
                 indexText = `색인 확인 실패 (${error?.message ?? error})`;
             }
-            $meta.text(`${live.length}항목 · ${indexText}`);
+            // 랜덤이 꺼진 북에 후보·쿨다운 숫자를 띄우면 "뽑히는 중"으로 읽힌다 → 꺼짐을 먼저 말한다
+            const randomText = isRandomEnabled(name)
+                ? `랜덤 후보 ${indexTargets.length}개 · 쿨다운 ${randomCooldownSize(indexTargets.length)}`
+                : '랜덤 꺼짐';
+            $meta.text(`${live.length}항목 · ${indexText} · ${randomText}`);
         } catch (error) {
             $meta.text(`읽기 실패: ${error?.message ?? error}`);
         }
@@ -3370,14 +3598,331 @@ async function renderLayerList() {
     }
 }
 
-function populateWorldSelect() {
+function populateWorldSelect($root = $(document)) {
     const settings = getSettings();
-    const $select = $('#jev_lorebook_world');
+    const $select = $root.find('#jev_lorebook_world');
     $select.empty().append('<option value="">— 자동: 위에서 켠 층의 로어북 —</option>');
     for (const name of (world_names ?? [])) {
         $select.append($('<option>').val(name).text(name));
     }
     $select.val(settings.world);
+}
+
+/**
+ * 확장 탭 감지 요약 한 줄 (v0.17.0) — `북 3개 · 총 87항목 · 색인 ✓`.
+ * 북별 상세 행은 팝업 A로 내렸으니, 탭에는 "지금 몇 개가 잡혀 있고 색인이 됐나"만 남긴다.
+ * 로어북 로드·색인 대조가 있어 비동기 — 렌더를 막지 않는다.
+ */
+let detectSummaryRun = 0;
+async function renderDetectionSummary() {
+    const run = ++detectSummaryRun;
+    const $line = $('#jev_lorebook_detect_summary');
+    if (!$line.length) return;
+    const detailed = getTargetWorldsDetailed();
+    if (!detailed.length) {
+        $line.text('감지된 로어북이 없어요 — 채팅·캐릭터·전역·페르소나 중 한 곳에 연결하거나 아래에서 고정 대상을 골라 주세요.');
+        return;
+    }
+    $line.text(`북 ${detailed.length}개 · 확인 중…`);
+
+    let totalEntries = 0;
+    let indexTargets = 0;
+    let indexedCount = 0;
+    let failed = 0;
+    for (const { name } of detailed) {
+        try {
+            const worldData = await loadWorldInfo(name);
+            if (run !== detectSummaryRun) return;
+            const live = Object.values(worldData?.entries ?? {})
+                .filter(e => !e.disable && String(e.content ?? '').trim());
+            totalEntries += live.length;
+            const targets = live.filter(e => !e.constant);
+            indexTargets += targets.length;
+            const hashes = await vectorList(name);
+            if (run !== detectSummaryRun) return;
+            indexedCount += targets.filter(e => hashes.has(Number(getStringHash(String(e.content ?? ''))))).length;
+        } catch {
+            failed++; // 사유는 팝업 A의 북별 행이 그대로 보여준다 — 한 줄 요약에서는 개수만 센다
+        }
+    }
+    if (run !== detectSummaryRun) return;
+    const indexText = failed
+        ? `색인 확인 실패 ${failed}개`
+        : (indexTargets === 0
+            ? '색인 대상 없음'
+            : (indexedCount >= indexTargets ? '색인 ✓' : `색인 ✗ ${indexedCount}/${indexTargets}`));
+    $line.text(`북 ${detailed.length}개 · 총 ${totalEntries}항목 · ${indexText}`);
+}
+
+/**
+ * 주입 예산 합계 한 줄 (v0.17.0, 팝업 A — 요구 G).
+ * 형태: `이 채팅 · 코어 1,470 + 검색 10,000 + 랜덤 500 = 매 턴 ≈11,970`
+ *
+ * - 코어는 예산이 아니라 **실제 항목 토큰의 합**이라 getTokenCountAsync가 필요하다 → 렌더를 막지 않고 뒤에서 채운다
+ *   (v0.6.3 fillStackTokens 선례).
+ * - ⚠ 꺼진 코어는 합계에서 뺀다. 매 턴 주입되지 않는 걸 더하면 이 줄이 거짓말한다.
+ * - 검색·랜덤은 **북별 유효값의 합**이다(오버라이드 반영) — 인터셉터의 북별 예산 컷과 같은 계산이어야 한다.
+ *
+ * @param {*} [$root] 검색 기준. 팝업을 열 때는 아직 DOM에 안 붙은 $popup을 넘긴다.
+ */
+let budgetTotalRun = 0;
+async function renderBudgetTotal($root = $(document)) {
+    const run = ++budgetTotalRun;
+    const $line = $root.find('#jev_lorebook_budget_total');
+    if (!$line.length) return;
+    const worlds = getTargetWorlds();
+    if (!worlds.length) {
+        $line.text('감지된 로어북이 없어서 합계를 낼 수 없어요.');
+        return;
+    }
+    const searchBudget = worlds.reduce((sum, w) => sum + getBudgetTokens(w), 0);
+    const randomBudget = worlds.reduce((sum, w) => sum + (isRandomEnabled(w) ? getRandomBudget(w) : 0), 0);
+    const tail = `검색 ${searchBudget.toLocaleString()} + 랜덤 ${randomBudget.toLocaleString()}`;
+    $line.text(`이 채팅 · 코어 집계 중… + ${tail}`);
+
+    try {
+        let coreTokens = 0;
+        for (const world of worlds) {
+            const worldData = await loadWorldInfo(world);
+            for (const entry of Object.values(worldData?.entries ?? {})) {
+                if (!entry?.constant || entry.disable) continue; // 꺼진 코어는 주입되지 않는다
+                const text = String(entry.content ?? '');
+                if (!text.trim()) continue;
+                coreTokens += await getTokenCountAsync(text);
+            }
+        }
+        if (run !== budgetTotalRun) return;
+        const total = coreTokens + searchBudget + randomBudget;
+        $line.text(`이 채팅 · 코어 ${coreTokens.toLocaleString()} + ${tail} = 매 턴 ≈${total.toLocaleString()}`);
+    } catch (error) {
+        if (run !== budgetTotalRun) return;
+        $line.text(`이 채팅 · ${tail} · 코어 집계에 실패했어요: ${error?.message ?? error}`);
+    }
+}
+
+/**
+ * 로어북 하나짜리 설정 팝업 (v0.17.0 — 요구 H).
+ *
+ * 네 칸 모두 '비우면 전역값 상속'이다. 랜덤 켜기만 select인 이유: 체크박스로는 '미설정'을 표현할 수 없다
+ * — 그 북만 끄는 것(false)과 전역을 따르는 것(미설정)은 다른 상태다.
+ * 저장은 입력 즉시(saveSettingsDebounced). 값이 비면 키를 지우고, 레코드가 비면 레코드째 지운다
+ * — 빈 레코드를 남기면 '설정 있음' 배지가 거짓말한다.
+ */
+async function openWorldSettingsPopup(world) {
+    const html = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'popup-world');
+    const $popup = $(html);
+    const store = getPerWorldStore();
+    const rec = () => {
+        const r = store[world];
+        return (r && typeof r === 'object' && !Array.isArray(r)) ? r : null;
+    };
+
+    $popup.find('#jev_world_title').text(world);
+
+    const showEffective = () => {
+        $popup.find('#jev_world_effective').text(
+            `지금 적용되는 값 — 주입 예산 ${getBudgetTokens(world).toLocaleString()}`
+            + ` · 랜덤 ${isRandomEnabled(world) ? '켜짐' : '꺼짐'}`
+            + ` · 랜덤 예산 ${getRandomBudget(world).toLocaleString()}`
+            + ` · 회수 후보 ${getQueryTopK(world)}`);
+    };
+
+    const setKey = (key, value) => {
+        let r = rec();
+        if (!r) { r = {}; store[world] = r; }
+        if (value === undefined) delete r[key];
+        else r[key] = value;
+        if (!Object.keys(r).length) delete store[world];
+        saveSettingsDebounced();
+        showEffective();
+        void renderLayerList();
+        void renderBudgetTotal();
+    };
+
+    // 숫자 3칸 — placeholder에 현재 전역값을 찍는다. "이 칸을 안 건드리면 무슨 값이 되는지"가 화면에 있어야 한다.
+    const numberFields = [
+        { id: '#jev_world_budget', key: 'budgetTokens', min: BUDGET_TOKENS_MIN, max: BUDGET_TOKENS_MAX, fallback: getBudgetTokens() },
+        { id: '#jev_world_random_budget', key: 'randomBudgetTokens', min: RANDOM_BUDGET_MIN, max: RANDOM_BUDGET_MAX, fallback: getRandomBudget() },
+        { id: '#jev_world_topk', key: 'queryTopK', min: TOP_K_MIN, max: TOP_K_MAX, fallback: getQueryTopK() },
+    ];
+    for (const field of numberFields) {
+        const current = resolveOverride(rec()?.[field.key]);
+        $popup.find(field.id)
+            .attr('placeholder', `전역값 ${field.fallback.toLocaleString()}`)
+            .val(current !== undefined ? String(current) : '')
+            .on('input', function () {
+                const raw = String($(this).val()).trim();
+                if (!raw) { setKey(field.key, undefined); return; } // 비우면 상속으로 되돌린다
+                setKey(field.key, clampSetting(raw, field.min, field.max, field.fallback));
+            });
+    }
+
+    const randomOverride = resolveOverride(rec()?.randomEnabled);
+    $popup.find('#jev_world_random_enabled')
+        .val(randomOverride === undefined ? '' : (randomOverride === true ? 'on' : 'off'))
+        .on('change', function () {
+            const value = String($(this).val());
+            setKey('randomEnabled', value === '' ? undefined : value === 'on');
+        });
+
+    $popup.find('#jev_world_reset').on('click', function () {
+        delete store[world];
+        saveSettingsDebounced();
+        for (const field of numberFields) $popup.find(field.id).val('');
+        $popup.find('#jev_world_random_enabled').val('');
+        showEffective();
+        void renderLayerList();
+        void renderBudgetTotal();
+        toastr.info(`'${world}'의 설정을 지웠어요 — 이제 전역값을 따라요.`, 'Jev Lorebook');
+    });
+
+    showEffective();
+    await callGenericPopup($popup, POPUP_TYPE.TEXT, '', {
+        wide: true,
+        allowVerticalScrolling: true,
+        leftAlign: true,
+        okButton: '닫기',
+    });
+}
+
+/**
+ * 팝업 A 「주입 세부 설정」 (v0.17.0 — 요구 F).
+ *
+ * ⚠ 팝업이 닫히면 DOM이 통째로 사라진다 → 값 주입·이벤트 바인딩·목록 렌더를 **열 때마다** 다시 한다.
+ *   로드 1회 바인딩으로 두면 두 번째로 열 때 컨트롤이 전부 죽는다.
+ * ⚠ 렌더 함수에는 아직 DOM에 안 붙은 $popup을 $root로 넘긴다 — 전역 셀렉터는 이 시점에 아무것도 못 찾는다.
+ * 저장은 입력 즉시(saveSettingsDebounced) — 닫을 때 일괄 저장으로 바꾸지 않는다.
+ */
+async function openInjectionSettingsPopup() {
+    const settings = getSettings();
+    const html = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'popup-injection');
+    const $popup = $(html);
+
+    $popup.find('#jev_lorebook_budget').val(settings.budgetTokens).on('input', function () {
+        settings.budgetTokens = clampSetting($(this).val(), BUDGET_TOKENS_MIN, BUDGET_TOKENS_MAX, defaultSettings.budgetTokens);
+        saveSettingsDebounced();
+        void renderBudgetTotal($popup);
+    });
+
+    $popup.find('#jev_lorebook_random_enabled').prop('checked', settings.randomEnabled === true).on('change', function () {
+        settings.randomEnabled = !!$(this).prop('checked');
+        saveSettingsDebounced();
+        void renderLayerList($popup);   // 행의 '랜덤 후보/쿨다운'이 켜짐 여부에 따라 바뀐다
+        void renderBudgetTotal($popup);
+    });
+
+    $popup.find('#jev_lorebook_random_budget').val(getRandomBudget()).on('input', function () {
+        settings.randomBudgetTokens = clampSetting($(this).val(), RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
+        saveSettingsDebounced();
+        void renderBudgetTotal($popup);
+    });
+
+    // topK 슬라이더 — 옆 숫자는 input에서 즉시 따라간다(놓을 때까지 모르면 조절을 못 한다)
+    $popup.find('#jev_lorebook_topk').val(getQueryTopK()).on('input', function () {
+        const value = clampSetting($(this).val(), TOP_K_MIN, TOP_K_MAX, DEFAULT_TOP_K);
+        settings.queryTopK = value;
+        $popup.find('#jev_lorebook_topk_value').text(String(value));
+        saveSettingsDebounced();
+    });
+    $popup.find('#jev_lorebook_topk_value').text(String(getQueryTopK()));
+
+    // 감지 대상 층 on/off (v0.8.0) — 끄면 그 층의 북이 감지 목록에서 빠진다
+    for (const [key, selector] of Object.entries(LAYER_INPUTS)) {
+        $popup.find(selector).prop('checked', settings[key] !== false).on('change', function () {
+            settings[key] = !!$(this).prop('checked');
+            saveSettingsDebounced();
+            void renderLayerList($popup);
+            void fillTopKTotal($popup);
+            void renderBudgetTotal($popup);
+            void renderDetectionSummary(); // 확장 탭 한 줄도 같이 따라가야 한다
+        });
+    }
+
+    $popup.find('#jev_lorebook_world').on('change', function () {
+        settings.world = String($(this).val());
+        saveSettingsDebounced();
+        void renderLayerList($popup);
+        void fillTopKTotal($popup);
+        void renderBudgetTotal($popup);
+        void renderDetectionSummary();
+    });
+
+    populateWorldSelect($popup);
+    void fillTopKTotal($popup);
+    void renderLayerList($popup);
+    void renderBudgetTotal($popup);
+
+    await callGenericPopup($popup, POPUP_TYPE.TEXT, '', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: true,
+        leftAlign: true,
+        okButton: '닫기',
+    });
+}
+
+/**
+ * 팝업 B 「로어북 만들기 설정」 (v0.17.0 — 요구 F).
+ * 팝업 A와 같은 규칙: 열 때마다 바인딩·렌더, 저장은 입력 즉시.
+ */
+async function openConvertSettingsPopup() {
+    const settings = getSettings();
+    const html = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'popup-convert');
+    const $popup = $(html);
+
+    // 변환 프로필 (v0.5) — 열 때마다 최신 목록으로 갱신. focus에서도 다시 채운다(그새 프로필이 추가될 수 있다)
+    populateConvertProfiles($popup);
+    $popup.find('#jev_lorebook_convert_profile')
+        .on('focus', function () { populateConvertProfiles($popup); })
+        .on('change', function () {
+            settings.convertProfileId = String($(this).val());
+            saveSettingsDebounced();
+        });
+
+    $popup.find('#jev_lorebook_slice_tokens').val(getSliceTokens()).on('input', function () {
+        settings.sliceTokens = clampSetting($(this).val(), SLICE_TOKENS_MIN, SLICE_TOKENS_MAX, DEFAULT_SLICE_TOKENS);
+        saveSettingsDebounced();
+    });
+
+    $popup.find('#jev_lorebook_convert_max_tokens').val(getConvertMaxTokens()).on('input', function () {
+        settings.convertMaxTokens = clampSetting($(this).val(), CONVERT_MAX_TOKENS_MIN, CONVERT_MAX_TOKENS_MAX, DEFAULT_CONVERT_MAX_TOKENS);
+        saveSettingsDebounced();
+    });
+
+    $popup.find('#jev_lorebook_incident_max_tokens').val(getIncidentMaxTokens()).on('input', function () {
+        settings.incidentMaxTokens = clampSetting($(this).val(), INCIDENT_TOKENS_MIN, INCIDENT_TOKENS_MAX, DEFAULT_INCIDENT_MAX_TOKENS);
+        saveSettingsDebounced();
+    });
+
+    // 스타일 지시문 — 빈 값이 곧 기본값이라 placeholder에도 같은 글을 넣는다
+    $popup.find('#jev_lorebook_convert_style')
+        .attr('placeholder', DEFAULT_CONVERT_STYLE)
+        .val(String(settings.convertStyle || ''))
+        .on('input', function () {
+            settings.convertStyle = String($(this).val());
+            saveSettingsDebounced();
+        });
+    $popup.find('#jev_lorebook_style_reset').on('click', function () {
+        settings.convertStyle = '';
+        $popup.find('#jev_lorebook_convert_style').val('');
+        saveSettingsDebounced();
+        toastr.info('변환 스타일 지시문을 기본값으로 되돌렸어요.', 'Jev Lorebook');
+    });
+
+    // 최근 메시지 보존 — 요술봉 패널의 #jev_panel_keep_recent와 **같은 값**이다(창구가 둘)
+    $popup.find('#jev_lorebook_keep_recent').val(getKeepRecent()).on('input', function () {
+        const value = Number($(this).val());
+        settings.keepRecent = Number.isFinite(value) && value >= 0 ? Math.floor(value) : defaultSettings.keepRecent;
+        saveSettingsDebounced();
+    });
+
+    await callGenericPopup($popup, POPUP_TYPE.TEXT, '', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: true,
+        leftAlign: true,
+        okButton: '닫기',
+    });
 }
 
 jQuery(async () => {
@@ -3396,78 +3941,11 @@ jQuery(async () => {
         saveSettingsDebounced();
     });
 
-    $('#jev_lorebook_budget').val(settings.budgetTokens).on('input', function () {
-        settings.budgetTokens = Number($(this).val()) || defaultSettings.budgetTokens;
-        saveSettingsDebounced();
-    });
-
-    // 🎲 랜덤 주입 (v0.15.0) — 예산은 위 주입 예산과 별개 통이다
-    $('#jev_lorebook_random_enabled').prop('checked', settings.randomEnabled === true).on('change', function () {
-        settings.randomEnabled = !!$(this).prop('checked');
-        saveSettingsDebounced();
-    });
-
-    $('#jev_lorebook_random_budget').val(getRandomBudget()).on('input', function () {
-        settings.randomBudgetTokens = clampSetting($(this).val(), RANDOM_BUDGET_MIN, RANDOM_BUDGET_MAX, DEFAULT_RANDOM_BUDGET);
-        saveSettingsDebounced();
-    });
-
-    $('#jev_lorebook_world').on('change', function () {
-        settings.world = String($(this).val());
-        saveSettingsDebounced();
-        void renderLayerList();
-        void fillTopKTotal(); // 대상이 바뀌면 '전체 N개'도 따라가야 한다
-    });
-
-    $('#jev_lorebook_keep_recent').val(settings.keepRecent).on('input', function () {
-        const value = Number($(this).val());
-        settings.keepRecent = Number.isFinite(value) && value >= 0 ? value : defaultSettings.keepRecent;
-        saveSettingsDebounced();
-    });
+    // ── 확장 탭에 남는 것 (v0.17.0) ──────────────────────────────────
+    // 켜기 / Jev 키 / 임베딩(소스·키 상태·전용키 모드·모델·재색인 경고) / [색인] / 상태줄 / 감지 요약 / 팝업 버튼 2개.
+    // 나머지 입력칸은 팝업 A(주입 세부)·B(로어북 만들기)로 내렸다 — 탭에 20칸 넘게 늘어놓으면 쓸 수 없다는 게 발주 사유다.
 
     $('#jev_lorebook_index').on('click', indexLorebook);
-
-    // ── v0.7.0 신규 설정 ──
-    // topK 슬라이더 — 옆 숫자는 input에서 즉시 따라간다(놓을 때까지 몰라야 하면 조절을 못 한다)
-    $('#jev_lorebook_topk').val(getQueryTopK()).on('input', function () {
-        const value = clampSetting($(this).val(), TOP_K_MIN, TOP_K_MAX, DEFAULT_TOP_K);
-        settings.queryTopK = value;
-        $('#jev_lorebook_topk_value').text(String(value));
-        saveSettingsDebounced();
-    });
-    $('#jev_lorebook_topk_value').text(String(getQueryTopK()));
-    void fillTopKTotal();
-    void renderLayerList();
-
-    $('#jev_lorebook_slice_tokens').val(getSliceTokens()).on('input', function () {
-        settings.sliceTokens = clampSetting($(this).val(), SLICE_TOKENS_MIN, SLICE_TOKENS_MAX, DEFAULT_SLICE_TOKENS);
-        saveSettingsDebounced();
-    });
-
-    $('#jev_lorebook_convert_max_tokens').val(getConvertMaxTokens()).on('input', function () {
-        settings.convertMaxTokens = clampSetting($(this).val(), CONVERT_MAX_TOKENS_MIN, CONVERT_MAX_TOKENS_MAX, DEFAULT_CONVERT_MAX_TOKENS);
-        saveSettingsDebounced();
-    });
-
-    $('#jev_lorebook_incident_max_tokens').val(getIncidentMaxTokens()).on('input', function () {
-        settings.incidentMaxTokens = clampSetting($(this).val(), INCIDENT_TOKENS_MIN, INCIDENT_TOKENS_MAX, DEFAULT_INCIDENT_MAX_TOKENS);
-        saveSettingsDebounced();
-    });
-
-    // 스타일 지시문 — 빈 값이 곷 기본값이라 placeholder에도 같은 글을 넣는다
-    $('#jev_lorebook_convert_style')
-        .attr('placeholder', DEFAULT_CONVERT_STYLE)
-        .val(String(settings.convertStyle || ''))
-        .on('input', function () {
-            settings.convertStyle = String($(this).val());
-            saveSettingsDebounced();
-        });
-    $('#jev_lorebook_style_reset').on('click', function () {
-        settings.convertStyle = '';
-        $('#jev_lorebook_convert_style').val('');
-        saveSettingsDebounced();
-        toastr.info('변환 스타일 지시문을 기본값으로 되돌렸어요.', 'Jev Lorebook');
-    });
 
     // 임베딩 소스/모델 (v0.5) — 변경 시 기존 색인과 벡터 차원이 어긋나므로 재색인 경고
     populateEmbeddingSourceSelect();
@@ -3506,30 +3984,12 @@ jQuery(async () => {
         updateEmbeddingSourceUi();
     });
 
-    // 변환 프로필 (v0.5) — 열 때마다 최신 목록으로 갱신
-    populateConvertProfiles();
-    $('#jev_lorebook_convert_profile').on('focus', populateConvertProfiles).on('change', function () {
-        settings.convertProfileId = String($(this).val());
-        saveSettingsDebounced();
-    });
+    // 세부 설정 팝업 2개 (v0.17.0) — 값 주입·바인딩·목록 렌더는 '열 때마다' 팝업 함수 안에서 다시 한다.
+    // 팝업이 닫히면 DOM이 통째로 사라지므로 로드 1회 바인딩으로 두면 두 번째로 열 때 컨트롤이 전부 죽는다.
+    $('#jev_lorebook_open_injection').on('click', () => void openInjectionSettingsPopup());
+    $('#jev_lorebook_open_convert').on('click', () => void openConvertSettingsPopup());
 
-    // 감지 대상 층 on/off (v0.8.0) — 전부 기본 켜짐. 끄면 그 층의 북이 감지 목록에서 빠진다.
-    const LAYER_INPUTS = {
-        layerChat: '#jev_lorebook_layer_chat',
-        layerChar: '#jev_lorebook_layer_char',
-        layerGlobal: '#jev_lorebook_layer_global',
-        layerPersona: '#jev_lorebook_layer_persona',
-    };
-    for (const [key, selector] of Object.entries(LAYER_INPUTS)) {
-        $(selector).prop('checked', settings[key] !== false).on('change', function () {
-            settings[key] = !!$(this).prop('checked');
-            saveSettingsDebounced();
-            void renderLayerList();
-            void fillTopKTotal(); // 대상이 바뀌면 '전체 N개'도 따라가야 한다
-        });
-    }
-
-    populateWorldSelect();
+    void renderDetectionSummary();
 
     // 본문 날짜 헤더 자동 마이그레이션 (v0.12.0) — 채팅이 바뀔 때마다 대상 로어북을 보고 아직 안 한 것만 처리.
     // 확장 로드 시점엔 이미 채팅이 열려 있을 수 있어 CHAT_CHANGED가 안 온다 → 여기서 1회 직접 돌린다.
@@ -3537,6 +3997,7 @@ jQuery(async () => {
         eventSource.on(event_types.CHAT_CHANGED, () => {
             void runHeaderMigration();
             resetRandomCooldown(); // 🎲 채팅이 바뀌면 쿨다운 링버퍼를 비운다 (v0.15.0)
+            void renderDetectionSummary(); // 감지 대상은 채팅에 딸려 바뀐다 — 한 줄 요약도 따라가야 한다 (v0.17.0)
         });
     } else {
         console.warn(`${LOG} event_types.CHAT_CHANGED가 없다 — 헤더 마이그레이션은 로드 시 1회만 돌아간다`);
@@ -3547,6 +4008,7 @@ jQuery(async () => {
         eventSource.on(event_types.WORLDINFO_UPDATED, () => {
             populateWorldSelect();
             void renderLayerList();
+            void renderDetectionSummary();
         });
     }
 

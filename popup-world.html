@@ -1,0 +1,30 @@
+<div class="jev-lorebook-settings jev-popup-body jev-world-popup">
+    <div id="jev_world_title" class="jev-panel-world-title"></div>
+    <div class="jev-set-body">
+
+    <small class="jev-set-help">비워 두면 전역 설정값을 그대로 써요. 값을 넣은 칸만 이 로어북에서 달라져요.</small>
+
+    <label for="jev_world_budget">턴당 주입 예산</label>
+    <input id="jev_world_budget" class="text_pole" type="number" min="500" max="20000" step="100" />
+
+    <label for="jev_world_random_enabled">🎲 랜덤 주입</label>
+    <select id="jev_world_random_enabled" class="text_pole">
+        <option value="">— 전역 설정을 따라요 —</option>
+        <option value="on">이 로어북만 켜기</option>
+        <option value="off">이 로어북만 끄기</option>
+    </select>
+
+    <label for="jev_world_random_budget">랜덤 주입 예산</label>
+    <input id="jev_world_random_budget" class="text_pole" type="number" min="0" max="20000" step="50" />
+
+    <label for="jev_world_topk">회수 후보 수</label>
+    <input id="jev_world_topk" class="text_pole" type="number" min="20" max="50" step="5" />
+
+    <div id="jev_world_reset" class="menu_button menu_button_icon" title="이 로어북의 설정을 모두 지우고 전역값을 따르게 해요">
+        <i class="fa-solid fa-rotate-left"></i>
+        <span>전역값으로 되돌리기</span>
+    </div>
+
+    <small id="jev_world_effective" class="jev-lorebook-status"></small>
+    </div>
+</div>

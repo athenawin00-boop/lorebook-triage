@@ -1,0 +1,56 @@
+<div class="jev-lorebook-settings jev-popup-body">
+    <h3>주입 세부 설정</h3>
+    <div class="jev-set-body">
+
+    <div class="jev-set-group">주입 예산</div>
+
+    <label for="jev_lorebook_budget">턴당 주입 예산</label>
+    <input id="jev_lorebook_budget" class="text_pole" type="number" min="500" max="20000" step="100" />
+    <small class="jev-set-help">매 턴 검색층 기억에 쓸 최대 토큰이에요. 아래 감지 목록에서 로어북별로 따로 정하지 않으면 전부 이 값을 써요. (기본 4,000)</small>
+
+    <label class="checkbox_label" for="jev_lorebook_random_enabled">
+        <input id="jev_lorebook_random_enabled" type="checkbox" />
+        <span>🎲 랜덤 주입</span>
+    </label>
+
+    <label for="jev_lorebook_random_budget">랜덤 주입 예산</label>
+    <input id="jev_lorebook_random_budget" class="text_pole" type="number" min="0" max="20000" step="50" />
+    <small class="jev-set-help">검색과 무관하게 무작위로 골라 넣어요. 방금 뽑힌 항목은 한동안 다시 나오지 않아요.</small>
+
+    <label for="jev_lorebook_topk">회수 후보 수</label>
+    <div class="jev-range-row">
+        <input id="jev_lorebook_topk" type="range" min="20" max="50" step="5" />
+        <span class="jev-range-value"><b id="jev_lorebook_topk_value">30</b><span id="jev_lorebook_topk_total" class="jev-range-total"></span></span>
+    </div>
+    <small class="jev-set-help">한 번에 판정대에 올릴 후보 수예요. 로어북이 크면 올려 주세요.</small>
+
+    <div id="jev_lorebook_budget_total" class="jev-budget-total"></div>
+
+    <div class="jev-set-group">대상 로어북 — Jev가 판단할 곳</div>
+
+    <label class="checkbox_label" for="jev_lorebook_layer_chat">
+        <input id="jev_lorebook_layer_chat" type="checkbox" />
+        <span>채팅에 연결된 로어북</span>
+    </label>
+    <label class="checkbox_label" for="jev_lorebook_layer_char">
+        <input id="jev_lorebook_layer_char" type="checkbox" />
+        <span>캐릭터 카드 로어북</span>
+    </label>
+    <label class="checkbox_label" for="jev_lorebook_layer_global">
+        <input id="jev_lorebook_layer_global" type="checkbox" />
+        <span>전역 로어북</span>
+    </label>
+    <label class="checkbox_label" for="jev_lorebook_layer_persona">
+        <input id="jev_lorebook_layer_persona" type="checkbox" />
+        <span>페르소나 로어북</span>
+    </label>
+
+    <small class="jev-set-help">끄면 그 로어북은 키워드 발동만 남아요.</small>
+
+    <div id="jev_lorebook_layer_list" class="jev-layer-list"></div>
+
+    <label for="jev_lorebook_world">대상 로어북</label>
+    <select id="jev_lorebook_world" class="text_pole"></select>
+    <small class="jev-set-help">고정하면 다른 채팅에도 같은 기억이 들어가요.</small>
+    </div>
+</div>
