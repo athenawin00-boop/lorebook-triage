@@ -13,7 +13,7 @@
  *   onEntryDemoted(world, items)  -> Promise           코어→검색층 강등 시 단건 벡터 삽입 (제브 전용)
  *   vectorList(world)             -> Promise<Set|null> 색인 대조용 저장 해시 (제브 전용)
  *   budgetTokens(world, layer)    -> number            북별 유효 주입 예산 (제브 전용)
- *   renderPanelJudgment($box, rejected)                Jev 탈락 후보 표
+ *   renderPanelJudgment($box, rejected)                판정 탈락 후보 표 (제브 전용)
  *   summaryRows($summary, row, worlds, settings)       패널 상태 요약의 제브 전용 3행
  *   lastReport() / lastError() / randomKeys()          직전 턴 판정 상태 조회
  *   openInjectionSettings()                            주입 세부 설정 팝업

@@ -1,14 +1,16 @@
 <div class="jev-lorebook-panel">
     <div class="jev-panel-header">
-        <h3>Jev Lorebook — 세부</h3>
+        <h3 id="jev_panel_heading"></h3>
         <div id="jev_panel_refresh" class="menu_button menu_button_icon" title="패널을 새로고침해요">
             <i class="fa-solid fa-rotate"></i>
             <span>새로고침</span>
         </div>
+        <!-- jev:start -->
         <div id="jev_panel_open_injection" class="menu_button menu_button_icon" title="주입 예산·랜덤·회수 후보 수·대상 층·로어북별 설정을 여기서 조정해요">
             <i class="fa-solid fa-sliders"></i>
             <span>주입 세부 설정</span>
         </div>
+        <!-- jev:end -->
         <div id="jev_panel_open_convert" class="menu_button menu_button_icon" title="챗 → 로어북 변환에 쓰는 모델·분량·문체를 여기서 조정해요">
             <i class="fa-solid fa-gears"></i>
             <span>로어북 만들기 설정</span>
@@ -26,18 +28,20 @@
 
     <div class="jev-panel-section">
         <div class="jev-panel-title">챗 → 로어북 변환</div>
-        <div class="jev-panel-muted">마지막 변환 지점 이후의 메시지만 요약해서 대상 로어북에 날짜별 항목으로 추가하고, 자동으로 색인까지 해 드려요.</div>
+        <div id="jev_panel_convert_help" class="jev-panel-muted"></div>
         <div id="jev_panel_convert_profile" class="jev-profile-badge"></div>
         <div class="flex-container">
             <div id="jev_panel_convert" class="menu_button menu_button_icon" title="새 메시지를 요약해 로어북 항목으로 변환하고 자동으로 색인해요">
                 <i class="fa-solid fa-wand-magic-sparkles"></i>
                 <span>챗 → 로어북 변환</span>
             </div>
+            <!-- jev:start -->
             <div id="jev_panel_reindex" class="menu_button menu_button_icon" title="대상 로어북 전체를 다시 색인해요 (초기화 후 재삽입)">
                 <i class="fa-solid fa-database"></i>
                 <span>재색인</span>
             </div>
-            <div id="jev_panel_undo" class="menu_button menu_button_icon" title="직전 변환을 통짜로 되돌려요 — 추가된 항목 삭제, 코어 복원, 변환 지점·작중 앵커 되돌림, 숨긴 메시지 복구, 재색인" style="display: none;">
+            <!-- jev:end -->
+            <div id="jev_panel_undo" class="menu_button menu_button_icon" title="직전 변환을 통짜로 되돌려요 — 추가된 항목 삭제, 코어 복원, 변환 지점·작중 앵커 되돌림, 숨긴 메시지 복구" style="display: none;">
                 <i class="fa-solid fa-rotate-left"></i>
                 <span>직전 변환 되돌리기</span>
             </div>
@@ -64,7 +68,7 @@
     </div>
 
     <div class="jev-panel-section">
-        <div class="jev-panel-title">색인 현황</div>
+        <div id="jev_panel_chunks_title" class="jev-panel-title"></div>
         <div id="jev_panel_chunks"></div>
     </div>
 </div>

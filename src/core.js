@@ -123,6 +123,16 @@ export async function guardPeerExclusive(action) {
  * ⚠️ 어느 **키가** 걸렸는지는 표시하지 않는다 — 그건 ST가 알려주지 않아 우리가 재매칭해야 하고,
  * 재매칭 결과는 ST의 실제 판정(정규식·whole words·대소문자·sticky)과 어긋날 수 있다. 발주 기각 사항.
  */
+// ── 배포본별 패널 구성 판정 (v0.19.0) ───────────────────────────────────
+// core는 `FLAVOR` 태그를 보지 않는다 — **그 기능의 훅이 등록됐는지**만 본다.
+// 태그로 갈리면 "제브인데 벡터 훅을 안 등록한 상태" 같은 조합에서 조용히 깨진다.
+/** 색인 칸·색인 대조 문구를 그릴까 (벡터 저장소가 있는 배포본만) */
+const indexPanelActive = () => !!hooks.vectorList;
+/** 점수 칸·🧠🎲 분류를 그릴까 (판정층이 있는 배포본만). 없으면 ⭐코어/🔑키워드 2층이다 */
+const judgmentPanelActive = () => !!hooks.lastReport;
+/** 주입 예산 줄을 그릴까 (선별 주입이 있는 배포본만) */
+const budgetPanelActive = () => !!hooks.budgetTokens;
+
 export function isRecentlyActivated(world, uid) {
     if (!lastActivated || !Array.isArray(lastActivated.entries)) return false;
     return lastActivated.entries.some(e => String(e.world) === String(world) && String(e.uid) === String(uid));
@@ -248,6 +258,9 @@ export function buildIncidentsPrompt(style, incidentMaxTokens, anchor) {
         '  The same date header may appear several times; that is expected.',
         `- Each incident is 6-12 sentences and stays under ${incidentMaxTokens} tokens.`,
         '- Optionally add one line per incident, exactly like: Keywords: a, b, c (at most 5).',
+        // flavor 추가 지시 (v0.19.0) — 논제브가 키워드 발동을 쓸 때만 제약을 더 건다.
+        // 제브는 이 훅을 등록하지 않으므로 전개 결과가 빈 배열이고 프롬프트는 이전과 바이트 동일하다.
+        ...(hooks.incidentPromptExtra?.() ?? []),
         '- Output nothing else: no preamble, no commentary.',
     ].join('\n');
 }
@@ -2229,11 +2242,32 @@ export function renderChatStack(chat, converted, keepRecent, chatLength) {
  * 막대 범례·판정문에 토큰을 채운다. 패널 렌더를 막지 않게 비동기로 분리.
  * 보존 버퍼는 변환 대상이 아니라 합산하지 않고 따로 보여준다.
  */
+/**
+ * 챗 적치 「대기」 구간의 토큰 수 (v0.19.0에서 산식을 한 곳으로 모았다).
+ * 막대(fillStackTokens)와 논제브 변환 시작 팝업의 실비 추정이 **같은 값**이어야 한다 —
+ * 두 곳에서 따로 계산하면 다음 수정에서 한쪽만 고쳐져 화면 두 군데가 다른 숫자를 말한다.
+ */
+export async function countPendingTokens(chat, from, to) {
+    const body = (chat ?? []).slice(from, to).map(m => String(m?.mes || '')).filter(Boolean).join('\n');
+    return body ? await getTokenCountAsync(body) : 0;
+}
+
+/**
+ * 지금 [챗→로어북 변환]을 누르면 넘어갈 구간. renderChatStack의 경계 계산과 동일하다
+ * (from = 마지막 변환 지점, to = 최근 보존 N개를 뺀 지점).
+ */
+export function getPendingRange() {
+    const ctx = SillyTavern.getContext();
+    const chat = ctx.chat ?? [];
+    const converted = Math.max(0, Number(ctx.chatMetadata?.[CONVERT_META_KEY]) || 0);
+    const to = Math.max(converted, chat.length - getKeepRecent());
+    return { chat, from: converted, to, count: Math.max(0, to - converted) };
+}
+
 export async function fillStackTokens($slots, chat, from, to, keepRecent, chatLength) {
     const join = (arr) => arr.map(m => String(m?.mes || '')).filter(Boolean).join('\n');
     try {
-        const pendingBody = join(chat.slice(from, to));
-        const pendingTokens = pendingBody ? await getTokenCountAsync(pendingBody) : 0;
+        const pendingTokens = await countPendingTokens(chat, from, to);
         const bufBody = keepRecent ? join(chat.slice(Math.max(0, chatLength - keepRecent))) : '';
         const bufTokens = bufBody ? await getTokenCountAsync(bufBody) : 0;
         const count = Math.max(0, to - from);
@@ -2300,11 +2334,15 @@ export async function renderPanelChunks($panel) {
         const emptyCount = allEntries.length - entries.length - coreEntries.length; // 본문이 비어 표에서 빠진 것
 
         let indexedCount = 0;
+        // 논제브 배포본엔 벡터 저장소가 없다 → '색인' 칸을 통째로 뺀다(사양 7).
+        // 칸을 남기고 '—'로 채우면 없는 기능을 있는 것처럼 보여주게 된다.
+        const showIndex = indexPanelActive();
+        const entryCols = showIndex ? 6 : 5;
         const $table = $('<table class="jev-panel-table">');
         const $thead = $('<tr>');
         // '날짜키' 칸 제거(v0.6.4) — keys[0]을 찍던 자리였고, v0.6.0에서 날짜 키 생성을 없앤 뒤로는
         // 사용자가 직접 넣은 키워드가 올라와 칸 이름이 거짓말을 하고 있었다. 본문은 [전문] 버튼으로 본다.
-        for (const h of ['색인', 'uid', '제목', '≈토큰', '', '']) {
+        for (const h of (showIndex ? ['색인', 'uid', '제목', '≈토큰', '', ''] : ['uid', '제목', '≈토큰', '', ''])) {
             $thead.append($('<th>').text(h));
         }
         $table.append($('<thead>').append($thead));
@@ -2319,32 +2357,36 @@ export async function renderPanelChunks($panel) {
             const $tr = $('<tr>')
                 .toggleClass('jev-row-off', isOff)
                 .toggleClass('jev-missing', (!isOff && indexedHashes) ? !isIndexed : false);
-            $tr.append($('<td>').text(isOff ? '—' : (indexedHashes ? (isIndexed ? '✓' : '✗') : '?')));
+            if (showIndex) $tr.append($('<td>').text(isOff ? '—' : (indexedHashes ? (isIndexed ? '✓' : '✗') : '?')));
             $tr.append($('<td>').text(e.uid));
             $tr.append($('<td class="jev-cell-title">').text(String(e.comment || `uid ${e.uid}`).slice(0, 48)));
             $tr.append($('<td>').text(approxTokens(content)));
             $tr.append(buildStateToggle(world, e.uid, getEntryState(e), $panel));
 
-            const { $cell, $detail } = buildDetailToggle(content, 6, { world, uid: e.uid, keys: e.key });
+            const { $cell, $detail } = buildDetailToggle(content, entryCols, { world, uid: e.uid, keys: e.key });
             $tr.append($cell);
             $tbody.append($tr).append($detail);
         }
         $table.append($tbody);
 
-        const headline = listError
-            ? `${world} — 항목 ${liveEntries.length}개 / 색인 대조에 실패했어요: ${listError}`
-            : `${world} — 항목 ${liveEntries.length}개 / 색인 ${indexedCount}개 / 미색인 ${liveEntries.length - indexedCount}개`
-              + (indexedHashes ? ` (벡터 저장소 ${indexedHashes.size}건)` : '')
-              + (offEntries ? ` · 꺼진 항목 ${offEntries}개 (회색 행)` : '')
+        const tailNote = (offEntries ? ` · 꺼진 항목 ${offEntries}개 (회색 행)` : '')
               + (emptyCount ? ` · 본문 빈 항목 ${emptyCount}개 제외` : '');
+        const headline = !showIndex
+            ? `${world} — 항목 ${liveEntries.length}개` + tailNote
+            : (listError
+                ? `${world} — 항목 ${liveEntries.length}개 / 색인 대조에 실패했어요: ${listError}`
+                : `${world} — 항목 ${liveEntries.length}개 / 색인 ${indexedCount}개 / 미색인 ${liveEntries.length - indexedCount}개`
+                  + (indexedHashes ? ` (벡터 저장소 ${indexedHashes.size}건)` : '')
+                  + tailNote);
         const $worldTitle = $('<div class="jev-panel-world-title">');
         const layer = layerOf.get(world);
         if (layer) $worldTitle.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
         $worldTitle.append($('<span>').text(headline));
         $section.append($worldTitle);
         $section.append($('<div class="jev-panel-muted">').text(
-            '동그라미를 누르면 🔵 상시 메모리(매 턴 주입) → 🟢 검색층 → ⚫ 꺼짐 → 🔵 순서로 돌아요. '
-            + '⚫에서 한 번 더 누르면 원래 색으로 돌아와요.'));
+            judgmentPanelActive()
+                ? '동그라미를 누르면 🔵 상시 메모리(매 턴 주입) → 🟢 검색층 → ⚫ 꺼짐 → 🔵 순서로 돌아요.'
+                : '동그라미를 누르면 🔵 상시(매 턴 주입) → 🟢 키워드 발동 → ⚫ 꺼짐 → 🔵 순서로 돌아요.'));
 
         // 코어 섹션 — constant라 ST가 매턴 네이티브 주입, Jev 판정·벡터 색인 제외.
         // v0.13.0: 규칙(최대 1) · 일기(최대 3, 오래된→최신, 봉인/열림 배지) · 기타(수동 승격분)를 구분 표시한다.
@@ -2354,13 +2396,20 @@ export async function renderPanelChunks($panel) {
             const coreOffCount = coreEntries.length - coreLive.length;
             const coreTokens = coreLive.reduce((sum, e) => sum + approxTokens(e.content), 0);
             const liveOtherCount = coreOther.filter(e => !e.disable).length;
-            const budget = getBudgetTokens(world, layer); // 북별 유효 예산 (오버라이드 반영)
+            // ⚠ 선별 주입이 없는 배포본에선 '주입 예산' 합산을 쓰지 않는다 — 예산이 0이라
+            //   `주입 예산 0 → 매 턴 ≈N`이 되어 그 줄이 거짓말한다.
+            const budget = budgetPanelActive() ? getBudgetTokens(world, layer) : 0;
             const $core = $('<div class="jev-panel-core">');
             $core.append($('<div class="jev-panel-core-title">').text(
                 `⭐ 코어 ${coreLive.length}개 (규칙 ${coreRules.filter(e => !e.disable).length} · 일기 ${coreDiaries.filter(e => !e.disable).length}${liveOtherCount ? ` · 기타 ${liveOtherCount}` : ''})`
                 + `${coreOffCount ? ` · 꺼짐 ${coreOffCount}개(합계 제외)` : ''} `
-                + `· 합계 ≈${coreTokens.toLocaleString()}토큰 · 주입 예산 ${budget.toLocaleString()} → 매 턴 ≈${(coreTokens + budget).toLocaleString()}토큰`));
-            $core.append($('<div class="jev-panel-muted">').text('매 턴 항상 주입돼요 (constant, Jev 판정을 거치지 않아요). 회색 행은 꺼진 항목이라 주입되지 않아요.'));
+                + `· 합계 ≈${coreTokens.toLocaleString()}토큰`
+                + (budgetPanelActive()
+                    ? ` · 주입 예산 ${budget.toLocaleString()} → 매 턴 ≈${(coreTokens + budget).toLocaleString()}토큰`
+                    : ` → 매 턴 ≈${coreTokens.toLocaleString()}토큰 고정비`)));
+            $core.append($('<div class="jev-panel-muted">').text(judgmentPanelActive()
+                ? '매 턴 항상 주입돼요 (constant, Jev 판정을 거치지 않아요). 회색 행은 꺼진 항목이라 주입되지 않아요.'
+                : '매 턴 항상 주입돼요 (constant). 회색 행은 꺼진 항목이라 주입되지 않아요.'));
 
             const $coreTable = $('<table class="jev-panel-table">');
             const $coreHead = $('<tr>');
@@ -2441,6 +2490,10 @@ export function renderPanelInjected($panel) {
     // lastReport가 없으면(첫 로드/판정 실패) 점수 칸과 탈락 블록만 빠지고 표는 그대로 그린다.
     const reportRows = new Map((lastReport?.rows ?? []).map(r => [`${r.world}.${r.uid}`, r]));
     const KIND_BADGE = { core: '⭐ 코어', jev: '🧠 Jev', random: '🎲 랜덤', keyword: '🔑 키워드' };
+    // 판정층이 없는 배포본은 분류가 구조적으로 ⭐코어/🔑키워드 2종뿐이다(lastReport·랜덤키가 비어 있으니
+    // classify가 나머지를 만들 수 없다). 그런데도 `🧠0 / 🎲0`을 찍으면 없는 기능을 있는 것처럼 보여준다.
+    const shownKinds = judgmentPanelActive() ? ['core', 'jev', 'random', 'keyword'] : ['core', 'keyword'];
+    const KIND_ICON = { core: '⭐', jev: '🧠', random: '🎲', keyword: '🔑' };
     // 🎲는 판정을 안 거쳤으니 점수 칸이 '—'다 (⭐·🔑과 같은 이유). 순서는 ⭐ → 🧠 → 🎲 → 🔑(나머지).
     const classify = (e) => (e.constant === true)
         ? 'core'
@@ -2452,14 +2505,18 @@ export function renderPanelInjected($panel) {
     const counts = { core: 0, jev: 0, random: 0, keyword: 0 };
     for (const r of rows) counts[r.kind]++;
     // 토큰은 비동기라 제목줄은 개수부터 띄우고 뒤에서 채운다 (fillStackTokens 선례, v0.6.3)
-    $title.text(`${INJECTED_TITLE} — ⭐${counts.core} / 🧠${counts.jev} / 🎲${counts.random} / 🔑${counts.keyword} · 집계 중…`);
+    $title.text(`${INJECTED_TITLE} — `
+        + shownKinds.map(k => `${KIND_ICON[k]}${counts[k]}`).join(' / ')
+        + ' · 집계 중…');
 
     $box.append($('<div class="jev-panel-muted">').text(
         `${new Date(lastActivated.ts).toLocaleTimeString()} 생성 · 총 ${rows.length}개`));
 
     // 북별 그룹 헤더로 묶는다 (v0.8.0 패턴 재사용) — 4계층이라 여러 북이 섞인다.
     const layerOf = new Map(getTargetWorldsDetailed().map(d => [d.name, d.layer]));
-    const headers = ['분류', '제목', '점수', '≈토큰', ''];
+    const headers = judgmentPanelActive()
+        ? ['분류', '제목', '점수', '≈토큰', '']
+        : ['분류', '제목', '≈토큰', ''];   // 판정을 안 거치므로 점수 칸 자체가 없다 (사양 7)
     const $table = $('<table class="jev-panel-table">');
     const $thead = $('<tr>');
     for (const h of headers) {
@@ -2484,7 +2541,7 @@ export function renderPanelInjected($panel) {
         const layer = layerOf.get(world);
         if (layer) $groupCell.append($('<span class="jev-layer-badge">').text(LAYER_LABELS[layer] ?? layer));
         $groupCell.append($('<span class="jev-group-name">').text(world || '(이름 없음)'));
-        $groupCell.append($('<span class="jev-group-meta">').text(`⭐${gc.core} · 🧠${gc.jev} · 🎲${gc.random} · 🔑${gc.keyword}`));
+        $groupCell.append($('<span class="jev-group-meta">').text(shownKinds.map(k => `${KIND_ICON[k]}${gc[k]}`).join(' · ')));
         $tbody.append($('<tr class="jev-panel-group-row">').append($groupCell));
 
         for (const r of groupRows) {
@@ -2498,7 +2555,9 @@ export function renderPanelInjected($panel) {
             $tr.append($('<td>').append($('<span class="jev-kind-badge">').addClass(`jev-kind-${r.kind}`).text(KIND_BADGE[r.kind])));
             $tr.append($('<td class="jev-cell-title">').text(String(r.entry.comment || `uid ${r.entry.uid}`).slice(0, 48)));
             // 점수는 판정을 거친 🧠만. ⭐·🔑에 숫자를 지어내면 표가 거짓말을 한다.
-            $tr.append($('<td>').text((r.kind === 'jev' && reportRow) ? reportRow.final.toFixed(3) : '—'));
+            if (judgmentPanelActive()) {
+                $tr.append($('<td>').text((r.kind === 'jev' && reportRow) ? reportRow.final.toFixed(3) : '—'));
+            }
             const $tok = $('<td>').text('…');
             $tr.append($tok);
 
@@ -2556,11 +2615,10 @@ export async function fillInjectedTokens($title, $cells, rows) {
             $cells[i].text(tokens[i].toLocaleString());
         }
         const sum = totals.core + totals.jev + totals.random + totals.keyword;
+        const kinds = judgmentPanelActive() ? ['core', 'jev', 'random', 'keyword'] : ['core', 'keyword'];
+        const icon = { core: '⭐', jev: '🧠', random: '🎲', keyword: '🔑' };
         $title.text(`${INJECTED_TITLE} — `
-            + `⭐${counts.core}·${totals.core.toLocaleString()}tok / `
-            + `🧠${counts.jev}·${totals.jev.toLocaleString()}tok / `
-            + `🎲${counts.random}·${totals.random.toLocaleString()}tok / `
-            + `🔑${counts.keyword}·${totals.keyword.toLocaleString()}tok`
+            + kinds.map(k => `${icon[k]}${counts[k]}·${totals[k].toLocaleString()}tok`).join(' / ')
             + ` · 합계 ${sum.toLocaleString()}tok`);
     } catch (error) {
         $title.text(`${INJECTED_TITLE} — 토큰 집계에 실패했어요: ${error?.message ?? error}`);
@@ -2580,6 +2638,12 @@ export async function refreshPanel($panel) {
 export async function openDetailPanel() {
     const html = await renderExtensionTemplateAsync(TEMPLATE_PATH, 'panel');
     const $panel = $(html);
+    // 표시 문자열은 flavor가 채운다 — panel.html은 양쪽이 공유하는 파일이라 제품명을 박아둘 수 없다.
+    $panel.find('#jev_panel_heading').text(`${DISPLAY_NAME} — 세부`);
+    $panel.find('#jev_panel_chunks_title').text(indexPanelActive() ? '색인 현황' : '로어북 항목');
+    $panel.find('#jev_panel_convert_help').text(indexPanelActive()
+        ? '마지막 변환 지점 이후의 메시지만 요약해서 대상 로어북에 날짜별 항목으로 추가하고, 자동으로 색인까지 해 드려요.'
+        : '마지막 변환 지점 이후의 메시지만 요약해서 대상 로어북에 날짜별 항목으로 추가해 드려요.');
     const setConvertStatus = (text) => $panel.find('#jev_panel_convert_status').text(text);
 
     $panel.find('#jev_panel_convert').on('click', async function () {

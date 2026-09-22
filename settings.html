@@ -1,7 +1,7 @@
 <div class="jev-lorebook-settings">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b id="jev_lorebook_title">Jev Lorebook</b>
+            <b id="jev_lorebook_title"></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -14,9 +14,12 @@
                 <span>켜기</span>
             </label>
 
+            <!-- jev:start -->
             <label for="jev_lorebook_api_key">Jev API 키 (TypeSafe)</label>
             <input id="jev_lorebook_api_key" class="text_pole" type="password" autocomplete="off" placeholder="Jev API 키가 필요해요. 키가 없으면 동작하지 않아요" />
+            <!-- jev:end -->
 
+            <!-- jev:start -->
             <div class="jev-set-group">검색 색인</div>
 
             <label for="jev_lorebook_embed_source">임베딩 소스</label>
@@ -59,13 +62,17 @@
 
             <small id="jev_lorebook_detect_summary" class="jev-detect-summary">확인 중…</small>
 
+            <!-- jev:end -->
+
             <div class="jev-set-group">세부 설정</div>
 
             <div class="jev-set-buttons">
+                <!-- jev:start -->
                 <div id="jev_lorebook_open_injection" class="menu_button menu_button_icon" title="주입 예산·랜덤·회수 후보 수·대상 층·로어북별 설정을 여기서 조정해요">
                     <i class="fa-solid fa-sliders"></i>
                     <span>주입 세부 설정</span>
                 </div>
+                <!-- jev:end -->
                 <div id="jev_lorebook_open_convert" class="menu_button menu_button_icon" title="챗 → 로어북 변환에 쓰는 모델·분량·문체를 여기서 조정해요">
                     <i class="fa-solid fa-wand-magic-sparkles"></i>
                     <span>로어북 만들기 설정</span>
