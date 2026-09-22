@@ -643,8 +643,9 @@ async function vectorPurge(worldName) {
 /**
  * 항목 3상태 (v0.17.0) — 🔵 상시(코어) / 🟢 검색층 / ⚫ 꺼짐.
  *
- * `disable`과 `constant`는 ST 엔트리의 **독립 필드**다. 그래서 끌 때 `disable`만 세우고 `constant`를 보존하면
- * "원래 무슨 색이었나"가 항목 안에 그대로 남는다 → 별도 백업 저장소를 만들 필요가 없다.
+ * `disable`과 `constant`는 ST 엔트리의 **독립 필드**다. 끌 때는 `disable`만 세우므로 별도 백업 저장소가 필요 없다.
+ * ⚠️ 복귀는 **항상 🔵 상시**로 간다 — 3상태가 한 방향으로 순환해야 🟢 검색층 항목을 🔵로 승격할 경로가 생긴다.
+ * "원래 색으로 복귀"(v0.17.0 1차안)는 초록 → 파랑 경로를 통째로 없애 승격 자체를 불가능하게 만들었다.
  */
 const ENTRY_STATE_CORE = 'core';
 const ENTRY_STATE_SEARCH = 'search';
@@ -658,7 +659,7 @@ function getEntryState(entry) {
 
 /**
  * 클릭 1회의 다음 상태와 패치 — 순수 함수(단위검증 대상).
- * 🔵 → 🟢 → ⚫ → (원래 색). 회색에서 복귀할 때 `constant`/`order`를 **건드리지 않는 것**이 이 설계의 핵심이다.
+ * 🔵 → 🟢 → ⚫ → 🔵 한 방향 순환. 세 상태 어디서든 세 번 안에 원하는 상태로 갈 수 있다.
  * needsIndex = 그 항목만 단건 벡터 삽입이 필요한가. 검색층으로 들어오는 경로에서만 true다
  * (코어는 회수 후보 필터가 constant를 이미 거르므로 색인 대상이 아니다).
  */
@@ -672,9 +673,9 @@ function planEntryStateCycle(entry) {
         // 끄기 — 벡터는 지우지 않는다. 회수 후보 필터가 disable을 이미 거르고, 남은 벡터는 다음 재색인에서 정리된다.
         return { from: state, to: ENTRY_STATE_OFF, patch: { disable: true }, needsIndex: false };
     }
-    // 복귀 — disable만 해제한다. constant가 살아 있으면 파랑, 없으면 초록으로 저절로 돌아간다.
-    const restored = entry?.constant ? ENTRY_STATE_CORE : ENTRY_STATE_SEARCH;
-    return { from: state, to: restored, patch: { disable: false }, needsIndex: restored === ENTRY_STATE_SEARCH };
+    // 켜기 — 순환을 닫는다. 항상 🔵 상시로 올라간다(여기가 🟢 → 🔵 승격의 유일한 통로다).
+    // order를 같이 올리는 이유: constant만 세우면 order 100이라 코어인데 프롬프트 최하단에 깔린다(v0.6.0 버그 재발 경로).
+    return { from: state, to: ENTRY_STATE_CORE, patch: { disable: false, constant: true, order: CORE_RULES_ORDER }, needsIndex: false };
 }
 
 /**
@@ -818,7 +819,7 @@ function buildDetailToggle(content, colSpan, meta = null) {
 
 /**
  * 항목 상태 전환 셀 (v0.17.0 — v0.6.4의 2상태 토글을 3상태로 확장).
- * 🔵 상시(코어) → 🟢 검색층 → ⚫ 꺼짐 → 원래 색. 확인 팝업 없음(기존 전환 버튼과 같은 정책).
+ * 🔵 상시(코어) → 🟢 검색층 → ⚫ 꺼짐 → 🔵 순환. 확인 팝업 없음(기존 전환 버튼과 같은 정책).
  * ⚫ 회색 행에서도 이 버튼이 동작해야 한다 — 확장 안에서 꺼진 항목을 되살릴 수 있는 유일한 경로다.
  */
 const ENTRY_STATE_CLASS = Object.freeze({
@@ -829,12 +830,12 @@ const ENTRY_STATE_CLASS = Object.freeze({
 const ENTRY_STATE_TITLE = Object.freeze({
     [ENTRY_STATE_CORE]: '상시 메모리(코어) — 누르면 검색층으로 내려요',
     [ENTRY_STATE_SEARCH]: '검색층 메모리 — 누르면 이 항목을 꺼요',
-    [ENTRY_STATE_OFF]: '꺼진 항목 — 누르면 원래 상태(상시 또는 검색층)로 되돌려요',
+    [ENTRY_STATE_OFF]: '꺼진 항목 — 누르면 상시 메모리로 켜요',
 });
 const ENTRY_STATE_DONE_TOAST = Object.freeze({
-    [ENTRY_STATE_CORE]: '상시 메모리(코어)로 되돌렸어요 — 매 턴 다시 주입돼요',
+    [ENTRY_STATE_CORE]: '상시 메모리(코어)로 올렸어요 — 매 턴 주입돼요',
     [ENTRY_STATE_SEARCH]: '검색층으로 내렸어요 (이 항목만 벡터에 넣었어요)',
-    [ENTRY_STATE_OFF]: '이 항목을 껐어요 — 표에 회색으로 남으니 한 번 더 누르면 되돌아와요',
+    [ENTRY_STATE_OFF]: '이 항목을 껐어요 — 표에 회색으로 남고, 한 번 더 누르면 상시 메모리로 켜져요',
 });
 
 function buildStateToggle(world, uid, state, $panel) {
@@ -3011,7 +3012,7 @@ async function renderPanelChunks($panel) {
         $worldTitle.append($('<span>').text(headline));
         $section.append($worldTitle);
         $section.append($('<div class="jev-panel-muted">').text(
-            '동그라미를 누르면 🔵 상시 메모리(매 턴 주입) → 🟢 검색층 → ⚫ 꺼짐 순서로 바뀌어요. '
+            '동그라미를 누르면 🔵 상시 메모리(매 턴 주입) → 🟢 검색층 → ⚫ 꺼짐 → 🔵 순서로 돌아요. '
             + '⚫에서 한 번 더 누르면 원래 색으로 돌아와요.'));
 
         // 코어 섹션 — constant라 ST가 매턴 네이티브 주입, Jev 판정·벡터 색인 제외.
@@ -3339,6 +3340,9 @@ async function openDetailPanel() {
     });
 
     $panel.find('#jev_panel_refresh').on('click', () => refreshPanel($panel));
+    // 채팅 중에 바로 조정할 수 있어야 한다 — 설정 서랍과 같은 팝업을 패널에서도 연다 (v0.17.1)
+    $panel.find('#jev_panel_open_injection').on('click', () => void openInjectionSettingsPopup());
+    $panel.find('#jev_panel_open_convert').on('click', () => void openConvertSettingsPopup());
 
     // 남겨둘 최근 챗 수 (v0.15.0) — 설정탭 #jev_lorebook_keep_recent와 **같은 값**이다(창구가 둘).
     // 1회용 값이 아니라 settings.keepRecent를 직접 쓰고, 바꾸면 막대·판정문을 다시 그려 미리보기가 된다.
