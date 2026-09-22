@@ -196,9 +196,17 @@ jQuery(async () => {
                 <span></span>
             </div>
         </div>`;
-    $('#extensionsMenu').append(wandHtml);
-    $('#jev_lorebook_wand_item').find('span').text(DISPLAY_NAME);
-    $('#jev_lorebook_wand_item').on('click', openDetailPanel);
+    // ⚠️ 전역 `$('#id')`로 이 항목을 다시 집지 않는다 (v0.19.1 버그픽스).
+    // 자매 확장을 둘 다 설치하면 이 마크업의 id가 문서에 **두 벌** 생기고, id 조회는 먼저 붙은
+    // 쪽 하나만 돌려준다. 그러면 나중에 실행된 쪽의 라벨(.text)과 클릭 핸들러가 둘 다 상대 항목에
+    // 얹히고, 자기 항목은 아이콘만 남아 라벨 없이 무반응이 된다. 실측 증상이 정확히 그것이었다.
+    // (게다가 어느 쪽이 먼저냐는 settings.html fetch 경합이라 비결정적이다 — 매번 뒤바뀔 수 있다.)
+    // → 생성한 엘리먼트를 붙들고 class로만 내려간다. children()·find('.class')는 id 조회를 안 쓴다.
+    const $wand = $(wandHtml);
+    const $wandItem = $wand.children('.list-group-item');
+    $('#extensionsMenu').append($wand);
+    $wandItem.find('span').text(DISPLAY_NAME);
+    $wandItem.on('click', openDetailPanel);
 
-    console.log(`${LOG} 로드 완료 v0.19.0 — flavor=jev, core=src/core.js`);
+    console.log(`${LOG} 로드 완료 v0.19.1 — flavor=jev, core=src/core.js`);
 });

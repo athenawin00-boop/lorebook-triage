@@ -1,11 +1,11 @@
 {
-    "display_name": "논제브 로어북",
+    "display_name": "NonJev Lorebook",
     "loading_order": 200,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "Hyeon",
-    "version": "0.19.0",
+    "version": "0.19.1",
     "homePage": "https://github.com/athenawin00-boop/lorebook-keeper"
 }

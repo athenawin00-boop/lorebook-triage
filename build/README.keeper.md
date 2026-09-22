@@ -1,4 +1,4 @@
-# 논제브 로어북 (Lorebook Keeper)
+# NonJev Lorebook (lorebook-keeper)
 
 **채팅이 길어지면 앞부분을 AI가 잊어버립니다. 이 확장은 지나간 대화를 날짜별 로어북 항목으로 정리해서, 잊히지 않게 남겨 둡니다.**
 
@@ -76,7 +76,7 @@ SillyTavern에는 **로어북**이라는 좋은 도구가 이미 있습니다. �
 
 이게 제약인 이유는 분명합니다. 골라 넣으려면 "지금 장면과 비슷한 기억"을 찾아야 하고, 그러려면 항목을 전부 외부 서비스에 보내 숫자로 바꿔 두어야 합니다(임베딩). 그건 위의 "외부로 나가는 데이터가 없다"와 맞바꿔야 하는 일입니다.
 
-**선별 주입이 필요하시면** 자매 확장 [제브 로어북](https://github.com/athenawin00-boop/lorebook-triage)을 쓰세요. 변환 파이프라인은 두 확장이 같은 코드를 공유하므로, 만들어지는 항목의 모양은 완전히 같습니다. 나중에 갈아타셔도 **변환 지점과 되돌리기 기록이 그대로 이어집니다.**
+**선별 주입이 필요하시면** 자매 확장 [Jev Lorebook](https://github.com/athenawin00-boop/lorebook-triage)을 쓰세요. 변환 파이프라인은 두 확장이 같은 코드를 공유하므로, 만들어지는 항목의 모양은 완전히 같습니다. 나중에 갈아타셔도 **변환 지점과 되돌리기 기록이 그대로 이어집니다.**
 
 > ⚠️ **두 확장을 동시에 켜지는 마세요.** 둘이 같은 로어북과 같은 변환 이력을 쓰기 때문에 서로의 기록을 덮어씁니다. 하나를 켜려 할 때 다른 하나가 켜져 있으면 확장이 먼저 물어보고, 승인하시면 저쪽을 끄고 이쪽을 켜 드립니다.
 
@@ -112,8 +112,8 @@ git clone https://github.com/athenawin00-boop/lorebook-keeper
 
 두 군데를 보시면 됩니다.
 
-1. **확장 목록**에 `논제브 로어북`이 보입니다
-2. 채팅창 아래 **요술봉(🪄) 메뉴**에 `논제브 로어북`이 보입니다 — 여기가 패널을 여는 유일한 입구입니다
+1. **확장 목록**에 `NonJev Lorebook`이 보입니다
+2. 채팅창 아래 **요술봉(🪄) 메뉴**에 `NonJev Lorebook`이 보입니다 — 여기가 패널을 여는 유일한 입구입니다
 
 둘 중 하나라도 안 보이면 하드 리프레시를 한 번 더 해 주세요.
 
@@ -123,7 +123,7 @@ git clone https://github.com/athenawin00-boop/lorebook-keeper
 
 ### 1. 켜기
 
-**확장 → 논제브 로어북 → 켜기**에 체크합니다.
+**확장 → NonJev Lorebook → 켜기**에 체크합니다.
 
 ### 2. 로어북 연결 확인
 
@@ -136,7 +136,7 @@ git clone https://github.com/athenawin00-boop/lorebook-keeper
 
 > 전역 로어북과 페르소나 로어북은 **저장처로 쓰지 않습니다.** 전역에 쌓으면 다른 모든 채팅에 이 캐릭터의 사건이 섞여 들어갑니다.
 
-### 3. 요술봉 → 논제브 로어북 → 패널 열기
+### 3. 요술봉 → NonJev Lorebook → 패널 열기
 
 패널 위쪽에 **챗 적치 막대**가 있습니다.
 
@@ -203,7 +203,7 @@ git clone https://github.com/athenawin00-boop/lorebook-keeper
 
 ## 패널에서 할 수 있는 일
 
-요술봉 → 논제브 로어북.
+요술봉 → NonJev Lorebook.
 
 ### 항목 상태 바꾸기 — 동그라미 한 번
 
@@ -308,7 +308,7 @@ git clone https://github.com/athenawin00-boop/lorebook-keeper
 </details>
 
 <details>
-<summary><b>제브 로어북과 같이 쓸 수 있나요?</b></summary>
+<summary><b>Jev Lorebook과 같이 쓸 수 있나요?</b></summary>
 
 **설치는 둘 다 해 두실 수 있지만, 켜는 건 한 번에 하나입니다.**
 
@@ -344,7 +344,7 @@ git clone https://github.com/athenawin00-boop/lorebook-keeper
 
 ## 설정
 
-**확장 → 논제브 로어북**에는 켜기 스위치와 `로어북 만들기 설정` 버튼만 있습니다. 채팅 중에도 바꾸실 수 있게, 같은 버튼이 패널 위쪽에도 있습니다.
+**확장 → NonJev Lorebook**에는 켜기 스위치와 `로어북 만들기 설정` 버튼만 있습니다. 채팅 중에도 바꾸실 수 있게, 같은 버튼이 패널 위쪽에도 있습니다.
 
 | 설정 | 기본값 | 안 건드리면 |
 |---|---|---|
@@ -363,7 +363,7 @@ git clone https://github.com/athenawin00-boop/lorebook-keeper
 
 MIT. 소스 전문이 공개돼 있으니 열어서 확인하실 수 있습니다.
 
-- **자매 확장(선별 주입):** [제브 로어북](https://github.com/athenawin00-boop/lorebook-triage) — 변환 파이프라인 코드를 공유합니다
+- **자매 확장(선별 주입):** [Jev Lorebook](https://github.com/athenawin00-boop/lorebook-triage) — 변환 파이프라인 코드를 공유합니다
 - **함께 쓰면 좋은 확장:** [로어북 매니저](https://github.com/foreverharibo-boop/lore-manager) — 항목 번역. 이 확장이 읽어서 같이 보여 드립니다
 
-버그나 제안은 이슈로 남겨 주세요. 로그에 `[논제브 로어북]` 프리픽스가 붙어 있으니, 브라우저 콘솔(F12)에서 그걸로 찾아 함께 올려 주시면 훨씬 빠릅니다.
+버그나 제안은 이슈로 남겨 주세요. 로그에 `[NonJev Lorebook]` 프리픽스가 붙어 있으니, 브라우저 콘솔(F12)에서 그걸로 찾아 함께 올려 주시면 훨씬 빠릅니다.

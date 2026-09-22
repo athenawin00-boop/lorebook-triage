@@ -27,7 +27,7 @@ export const DISPLAY_NAME = 'Jev Lorebook';
 
 /** 상대 확장(자매 배포본) — 상호 배제 감지 대상 */
 export const PEER_MODULE = 'lorebookKeeper';
-export const PEER_DISPLAY_NAME = '논제브 로어북';
+export const PEER_DISPLAY_NAME = 'NonJev Lorebook';
 
 /** 런타임 로드 마커. extension_settings 단독 판정은 미설치 잔존 설정으로 오탐한다 → 마커와 AND. */
 export const SELF_GLOBAL_MARKER = 'jevLorebookLoaded';

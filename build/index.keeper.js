@@ -1,5 +1,5 @@
 /**
- * 논제브 로어북 (lorebook-keeper) — 채팅을 날짜별 로어북 항목으로 정리해 주는 확장 (v0.19.0)
+ * NonJev Lorebook (lorebook-keeper) — 채팅을 날짜별 로어북 항목으로 정리해 주는 확장 (v0.19.1)
  *
  * 하는 일: 마지막 변환 지점 이후의 대화만 요약해서 대상 로어북에 날짜별 사건 항목으로 쌓고,
  * 「절대 잊으면 안 되는 것」은 ⭐ 코어 규칙·일기(매 턴 항상 들어가는 항목)로 따로 관리한다.
@@ -8,7 +8,7 @@
  *
  * 하지 않는 일: 외부 API로 기억을 **선별**하는 일. 임베딩·벡터 검색·판정 모델이 전혀 없고,
  * 어떤 데이터도 이 확장 때문에 외부로 나가지 않는다(변환 요약은 사용자가 이미 쓰고 있는
- * SillyTavern의 연결을 그대로 쓴다). 선별 주입이 필요하면 자매 확장 '제브 로어북'을 쓴다.
+ * SillyTavern의 연결을 그대로 쓴다). 선별 주입이 필요하면 자매 확장 'Jev Lorebook'을 쓴다.
  *
  * ── 소스 구조 (자매 배포본 '제브 로어북'과 코어를 공유한다) ──────────────────
  *   index.js        이 파일. 얇은 엔트리 — flavor+core+keeper를 물리고, 훅을 등록하고, 부팅한다
@@ -112,16 +112,25 @@ jQuery(async () => {
 
     // 요술봉(#extensionsMenu) 항목 — 패널을 여는 유일한 동선이다.
     // 부착 방식 선례: gallery/index.js:801 (extensionsMenu 직접), token-counter/index.js:105 (항목 마크업)
+    // ⚠️ 요술봉 항목 id만은 제브와 **다른 이름**을 쓴다 (v0.19.1 버그픽스).
+    // 설정 필드·chat_metadata 키는 호환 때문에 공용 이름을 지켜야 하지만, 이 두 id는 저장물과
+    // 아무 관계가 없고(전 파일 참조 0건, CSS 규칙도 없음) 같은 문서에 두 벌 생기면 사고가 난다.
     const wandHtml = `
-        <div id="jev_lorebook_wand_container" class="extension_container">
-            <div id="jev_lorebook_wand_item" class="list-group-item flex-container flexGap5">
+        <div id="lorebook_keeper_wand_container" class="extension_container">
+            <div id="lorebook_keeper_wand_item" class="list-group-item flex-container flexGap5">
                 <div class="fa-solid fa-book extensionsMenuExtensionButton"></div>
                 <span></span>
             </div>
         </div>`;
-    $('#extensionsMenu').append(wandHtml);
-    $('#jev_lorebook_wand_item').find('span').text(DISPLAY_NAME);
-    $('#jev_lorebook_wand_item').on('click', openDetailPanel);
+    // 그리고 id로 다시 집지 않는다 — 생성한 엘리먼트를 붙들고 class로만 내려간다.
+    // 전역 `$('#id')`로 집었을 때의 실측 증상: 먼저 붙은 쪽 하나만 잡히므로 나중에 실행된 쪽의
+    // 라벨(.text)과 클릭 핸들러가 둘 다 상대 항목에 얹히고, 자기 항목은 아이콘만 남아 무반응.
+    // (어느 쪽이 먼저냐는 settings.html fetch 경합이라 비결정적이다 — 매번 뒤바뀔 수 있다.)
+    const $wand = $(wandHtml);
+    const $wandItem = $wand.children('.list-group-item');
+    $('#extensionsMenu').append($wand);
+    $wandItem.find('span').text(DISPLAY_NAME);
+    $wandItem.on('click', openDetailPanel);
 
-    console.log(`${LOG} 로드 완료 v0.19.0 — flavor=keeper, core=src/core.js`);
+    console.log(`${LOG} 로드 완료 v0.19.1 — flavor=keeper, core=src/core.js`);
 });

@@ -1,5 +1,5 @@
 /**
- * flavor 상수 — **논제브 로어북(lorebook-keeper) 배포본용.**
+ * flavor 상수 — **NonJev Lorebook(논제브 로어북, lorebook-keeper) 배포본용.**
  * 빌드 시 `scripts/build-keeper.mjs`가 이 파일을 `src/flavor.js` 자리에 갈아끼운다.
  *
  * ⚠️ 여기 있는 것은 **표시 문자열과 모듈 네임스페이스**뿐이다.
@@ -19,10 +19,10 @@ export const MODULE = 'lorebookKeeper';
 export const TEMPLATE_PATH = 'third-party/lorebook-keeper';
 
 /** console 프리픽스 */
-export const LOG = '[논제브 로어북]';
+export const LOG = '[NonJev Lorebook]';
 
-/** 화면에 나가는 제품명 (toastr 제목·패널 머리글) */
-export const DISPLAY_NAME = '논제브 로어북';
+/** 화면에 나가는 제품명 (toastr 제목·패널 머리글·요술봉 라벨·설정 서랍 제목) */
+export const DISPLAY_NAME = 'NonJev Lorebook';
 
 /** 상대 확장(자매 배포본) — 상호 배제 감지 대상 */
 export const PEER_MODULE = 'jevLorebook';

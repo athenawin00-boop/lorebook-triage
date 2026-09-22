@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 논제브 로어북(lorebook-keeper) 배포본 빌드 — v0.19.0
+ * NonJev Lorebook(논제브 로어북, lorebook-keeper) 배포본 빌드 — v0.19.1
  *
  *   node scripts/build-keeper.mjs [--out <경로>]
  *
@@ -132,18 +132,52 @@ markerHits.length ? fails.push(`jev: 마커 잔존: ${markerHits.map(rel).join('
 const pathHits = textFiles.filter(p => fs.readFileSync(p, 'utf8').includes('third-party/lorebook-triage'));
 pathHits.length ? fails.push(`구 템플릿 경로 잔존: ${pathHits.map(rel).join(', ')}`) : ok.push("'third-party/lorebook-triage' 잔존 0건");
 
-// 7) 화면에 나가는 'Jev' 잔존 0건 (하드 실패)
-//    HTML은 전부 사용자 눈에 닿는 텍스트라 0이어야 한다. JS는 src/core.js만 예외다 —
-//    그 파일은 양쪽 배포본에서 바이트 동일해야 해서 제브 쪽 주석·미도달 문자열을 지울 수 없다.
-//    (미도달 근거: 🧠·🎲 분류와 탈락 후보 표는 judgmentPanelActive()=hooks.lastReport 등록 여부로
-//     가려지고, 논제브는 그 훅을 등록하지 않는다.)
-const visibleJev = textFiles.filter(p => {
-    if (path.relative(OUT, p) === path.join('src', 'core.js')) return false;
-    return /Jev/.test(fs.readFileSync(p, 'utf8'));
-});
-visibleJev.length
-    ? fails.push(`'Jev' 잔존(core.js 외): ${visibleJev.map(rel).join(', ')}`)
-    : ok.push("'Jev' 잔존 0건 (src/core.js 제외 — 아래 참고)");
+// 7) 정체성 검사 — v0.19.1에서 **부정형에서 긍정형으로** 바꿨다 (하드 실패)
+//    ⚠️ 이전 판은 "'Jev' 문자열 0건"을 요구했는데, 표시명이 'NonJev Lorebook'이 되면서 그 검사가
+//    구조적으로 못 쓰게 됐다: 자기 이름에 Jev가 부분문자열로 들어 있고, README는 자매 확장을
+//    'Jev Lorebook'이라는 실제 표시명으로 정당하게 소개한다. 부분문자열 금지로는 못 가른다.
+//    → (a) 정체성 상수가 논제브 값으로 **있는지** 확인하고 (b) 제브가 '자기 이름 자리'에
+//      쓰는 문자열만 골라 유출을 막는다.
+const KEEPER_DISPLAY = 'NonJev Lorebook';
+const flavorText = fs.readFileSync(path.join(OUT, 'src/flavor.js'), 'utf8');
+const identity = [
+    `DISPLAY_NAME = '${KEEPER_DISPLAY}'`,
+    `LOG = '[${KEEPER_DISPLAY}]'`,
+    "TEMPLATE_PATH = 'third-party/lorebook-keeper'",
+    "MODULE = 'lorebookKeeper'",
+];
+const identityMiss = identity.filter(n => !flavorText.includes(n));
+identityMiss.length
+    ? fails.push(`src/flavor.js 정체성 상수 어긋남: ${identityMiss.join(' / ')}`)
+    : ok.push('정체성 상수 4개 확인 (DISPLAY_NAME·LOG·TEMPLATE_PATH·MODULE)');
+
+if (manifest) {
+    manifest.display_name === KEEPER_DISPLAY
+        ? ok.push(`manifest display_name = "${KEEPER_DISPLAY}"`)
+        : fails.push(`manifest display_name이 "${manifest.display_name}" — "${KEEPER_DISPLAY}"여야 한다`);
+}
+
+// 제브가 자기 이름으로 쓰는 문자열(로그 프리픽스·설정 네임스페이스)이 남으면 화면·콘솔이 거짓말을 한다.
+// src/core.js는 바이트 동일 제약이 있어 제외한다 — 거기 남은 건 주석과 미도달 문자열뿐이다
+// (미도달 근거: 🧠·🎲 분류와 탈락 후보 표는 judgmentPanelActive()=hooks.lastReport 등록 여부로
+//  가려지고, 논제브는 그 훅을 등록하지 않는다.)
+// ⚠️ 단순 부분문자열로는 못 잡는다 — 첫 실행에서 오탐 2건이 나와 토큰을 좁혔다:
+//    ① `[Jev Lorebook](url)` 은 자매 확장을 소개하는 **마크다운 링크**다 → 뒤에 `(`가 없을 때만 유출
+//    ② `PEER_MODULE = 'jevLorebook'` 은 상대 네임스페이스라 정당하다 → 줄머리 `export const MODULE`만
+const JEV_SELF = [
+    ['제브 콘솔 프리픽스', /\[Jev Lorebook\](?!\()/],
+    ['제브 설정 네임스페이스', /^export const MODULE = 'jevLorebook'/m],
+];
+const jevLeak = [];
+for (const p of textFiles) {
+    if (path.relative(OUT, p) === path.join('src', 'core.js')) continue;
+    const t = fs.readFileSync(p, 'utf8');
+    const hit = JEV_SELF.filter(([, re]) => re.test(t)).map(([label]) => label);
+    if (hit.length) jevLeak.push(`${rel(p)}: ${hit.join(', ')}`);
+}
+jevLeak.length
+    ? fails.push(`제브 정체성 문자열 유출: ${jevLeak.join(' / ')}`)
+    : ok.push(`제브 정체성 문자열 ${JEV_SELF.length}종 유출 0건 (src/core.js 제외 — 아래 참고)`);
 
 const coreJev = (fs.readFileSync(path.join(OUT, 'src/core.js'), 'utf8').match(/Jev/g) ?? []).length;
 
@@ -164,6 +198,24 @@ if (fs.existsSync(path.join(OUT, 'package.json'))) {
         catch (e) { fails.push(`node --check 실패 ${rel(p)}: ${String(e.stderr ?? e).split('\n')[0]}`); }
     }
     ok.push(`node --check ${js.length}개 파일 통과 (package.json 없음 → 제자리 검사 가능)`);
+}
+
+// 9b) 요술봉 항목 id 충돌 가드 (v0.19.1 회귀 방지, 하드 실패)
+//    자매 확장을 둘 다 설치하면 공용 마크업 id가 같은 문서에 두 벌 생긴다. id 조회는 먼저 붙은
+//    쪽 하나만 돌려주므로, 나중에 실행된 쪽의 라벨과 클릭 핸들러가 둘 다 상대 항목에 얹히고
+//    자기 항목은 아이콘만 남아 무반응이 된다(v0.19.0 실측 버그). 막는 데 둘 다 필요하다:
+//    ① 요술봉 id를 제브와 다르게 둔다 ② 그 항목을 전역 $('#id')로 다시 집지 않는다.
+{
+    const idxText = fs.readFileSync(path.join(OUT, 'index.js'), 'utf8');
+    const globalWand = idxText.match(/\$\('#[\w-]*wand[\w-]*'\)/g) ?? [];
+    globalWand.length
+        ? fails.push(`index.js가 요술봉 항목을 전역 셀렉터로 집는다: ${globalWand.join(', ')}`)
+        : ok.push('요술봉 전역 셀렉터 0건');
+    const sharedWandId = idxText.includes('id="jev_lorebook_wand_');
+    const ownWandId = idxText.includes('id="lorebook_keeper_wand_item"');
+    if (sharedWandId) fails.push('요술봉 id가 제브와 같다(jev_lorebook_wand_*) — 같은 문서에 두 벌 생긴다');
+    if (!ownWandId) fails.push('요술봉 id lorebook_keeper_wand_item이 없다');
+    if (!sharedWandId && ownWandId) ok.push('요술봉 id 제브와 분리됨 (lorebook_keeper_wand_*)');
 }
 
 // 10) 키 유출 스캔
