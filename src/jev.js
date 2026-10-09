@@ -14,7 +14,7 @@ import { renderExtensionTemplateAsync } from '../../../../extensions.js';
 import { world_names, loadWorldInfo } from '../../../../world-info.js';
 import { getTokenCountAsync } from '../../../../tokenizers.js';
 import { getStringHash } from '../../../../utils.js';
-import { callGenericPopup, POPUP_TYPE } from '../../../../popup.js';
+import { callGenericPopup, POPUP_TYPE, POPUP_RESULT } from '../../../../popup.js';
 import { secret_state, SECRET_KEYS } from '../../../../secrets.js';
 import { oai_settings } from '../../../../openai.js';
 import { TEMPLATE_PATH, LOG, DISPLAY_NAME } from './flavor.js';
@@ -62,6 +62,15 @@ const QUERY_USER_MESSAGES = 3;   // 검색 쿼리로 쓸 최근 유저 메시지
 const SCENE_MESSAGES = 6;        // Jev에 보여줄 최근 장면 메시지 수
 
 const INSERT_CHUNK = 20;         // 색인 시 insert 배치 크기
+
+const RATE_LIMIT_WAIT_MS = 65000;   // 분당 한도는 60초 창 — 5초 여유를 두고 같은 배치를 다시 친다 (v0.20.0)
+
+const MAX_RATE_LIMIT_RETRIES = 3;   // 3회(≈3분)까지 버티고 멈춘다. 넣은 것은 남고 다음에 이어서 한다
+
+const ABORT_LABEL = '중단';          // 색인 중 버튼 라벨 (설정 버튼 2개가 공유 — 패널 쪽은 core.js가 따로 쓴다)
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 
 const JUDGMENT_CACHE_MS = 60000; // 동일 쿼리 판정 캐시 (같은 턴의 연쇄 quiet 생성 대응)
 
@@ -358,7 +367,8 @@ async function vectorError(response, what) {
     const hint = response.status >= 500
         ? ' — SillyTavern 서버 콘솔(터미널)에 실제 사유가 찍혀 있어요: 임베딩 키·모델 이름·항목 길이·요청 한도를 확인해 주세요'
         : '';
-    return new Error(`벡터 ${what} 실패 (HTTP ${response.status})${detail ? `: ${detail}` : ''}${hint}`);
+    // status를 달아 둔다 — 색인 재시도가 5xx(시간이 풀어줄 한도)인지 4xx(요청 오류)인지를 이걸로 가른다 (v0.20.0)
+    return Object.assign(new Error(`벡터 ${what} 실패 (HTTP ${response.status})${detail ? `: ${detail}` : ''}${hint}`), { status: response.status });
 }
 
 
@@ -405,6 +415,28 @@ async function vectorPurge(worldName) {
     });
     if (!response.ok) {
         throw await vectorError(response, 'purge');
+    }
+}
+
+
+/**
+ * 색인에서 특정 hash만 걷어낸다 (src/endpoints/vectors.js:547 POST /delete, v0.20.0).
+ * 증분 색인의 뒷정리 담당 — 항목 삭제·본문 변경·끄기·코어 승격으로 색인 대상에서 빠진 벡터를 치운다.
+ * 이게 없으면 '없는 항목'이 계속 후보로 올라온다(그게 전량 purge를 못 버리던 이유였다).
+ */
+async function vectorDelete(worldName, hashes) {
+    if (!hashes?.length) return;
+    const response = await fetch('/api/vector/delete', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            ...getEmbeddingBody(),
+            collectionId: getCollectionId(worldName),
+            hashes: hashes,
+        }),
+    });
+    if (!response.ok) {
+        throw await vectorError(response, 'delete');
     }
 }
 
@@ -957,40 +989,169 @@ console.log(`${LOG} 모듈 로드 v0.5.1 — interceptor 등록: ${typeof global
 // ── 색인 ────────────────────────────────────────────────────────────────
 
 
-/**
- * 로어북 1개 색인 (purge 후 재삽입). content만 임베딩 — key(날짜·키워드)는 구분자일 뿐 유사도 대상이 아니다.
- * @param {string} world 로어북 이름
- * @param {(text:string)=>void} [onProgress] 진행 콜백
- * @returns {Promise<number>} 색인된 항목 수
- */
-export async function indexWorld(world, onProgress) {
-    const worldData = await loadWorldInfo(world);
-    // constant 항목(코어 메모리)은 색인 제외 — ST 네이티브 매턴 주입이라 검색층에 있으면 이중 주입된다
-    const entries = Object.values(worldData?.entries ?? {})
-        .filter(e => !e.disable && !e.constant && String(e.content ?? '').trim());
+/** 색인 진행 상태 — 버튼이 [중단]으로 바뀌는 조건이자, 두 버튼이 동시에 도는 걸 막는 잠금이다 (v0.20.0) */
+let indexRunning = false;
+let indexAbortRequested = false;
 
-    if (!entries.length) {
-        console.log(`${LOG} '${world}' — 색인할 항목 0, 건너뜀`);
-        return 0;
-    }
+/** 설정·패널의 [중단]이 부르는 창구. 대기 중에도 먹는다 — 카운트다운이 1초마다 이 깃발을 본다. */
+export function requestIndexAbort() {
+    if (indexRunning) indexAbortRequested = true;
+}
 
-    const items = entries.map(e => ({
-        hash: getStringHash(String(e.content)),
-        text: String(e.content),
-        index: Number(e.uid),
-    }));
-
-    await vectorPurge(world);
-    for (let i = 0; i < items.length; i += INSERT_CHUNK) {
-        await vectorInsert(world, items.slice(i, i + INSERT_CHUNK));
-        onProgress?.(`색인 중… ${world}: ${Math.min(i + INSERT_CHUNK, items.length)}/${items.length}`);
-    }
-    console.log(`${LOG} 색인 완료: ${world} → ${items.length}개 항목, collectionId=${getCollectionId(world)}`);
-    return items.length;
+/** core의 패널 버튼이 '지금 돌고 있나'를 묻는 훅 (core → jev 직접 import 금지라 훅 경유) */
+export function isIndexing() {
+    return indexRunning;
 }
 
 
-export async function indexLorebook() {
+/**
+ * 중단·한도초과는 '실패'가 아니라 '여기까지 됐다'이다 — 호출부가 빨간 에러 대신 안내로 쓰게 표식을 단다.
+ * 넣은 것은 지우지 않는다: 다시 누르면 증분이 이어서 간다.
+ */
+function indexStopError(kind, inserted) {
+    const message = kind === 'abort'
+        ? `색인을 중단했어요 — ${inserted}개까지 넣었어요. [색인]을 다시 누르면 이어서 해요.`
+        : `요청 한도가 안 풀려서 ${inserted}개까지 했어요. [색인]을 다시 누르면 이어서 해요.`;
+    return Object.assign(new Error(message), { indexStop: kind, inserted: inserted });
+}
+
+
+/** 한도 해제 대기 — 1초마다 남은 시간을 상태줄에 쓰고 그 틈에 중단 요청을 본다. false를 돌려주면 중단된 것. */
+async function waitForRateLimit(onProgress, label) {
+    for (let left = Math.round(RATE_LIMIT_WAIT_MS / 1000); left > 0; left--) {
+        if (indexAbortRequested) return false;
+        onProgress?.(`${label}: 요청 한도에 걸렸어요 — ${left}초 뒤에 다시 시도할게요`);
+        await sleep(1000);
+    }
+    return !indexAbortRequested;
+}
+
+
+/**
+ * 배치 삽입 + 분당 한도 자동 대기 (v0.20.0).
+ *
+ * ST는 임베딩 제공자 오류를 종류 불문 sendStatus(500) 하나로 뭉갠다(endpoints/vectors.js) — 업스트림
+ * 429(분당 한도)도 여기로 들어온다. 그래서 상태코드로는 한도와 서버 고장을 못 가른다. 대신 '시간이
+ * 풀어주는 문제인가'로 가른다:
+ *   - 4xx         : 요청 자체가 틀린 것 → 기다려도 안 풀린다. 즉시 중단.
+ *   - 5xx인데 한 건도 못 넣음 + 대기 후 재시도도 실패 : 한도가 아니라 키·모델 문제다(요구 11).
+ *                   판정 근거(서버 콘솔 안내)가 들어 있는 원본 에러를 그대로 올린다.
+ *   - 그 외 5xx   : 한도로 보고 65초 기다렸다 같은 배치를 다시 친다. 최대 3회(≈3분).
+ */
+async function insertInBatches(world, items, onProgress, label) {
+    let inserted = 0;
+    let retriesUsed = 0;
+    for (let i = 0; i < items.length; i += INSERT_CHUNK) {
+        const batch = items.slice(i, i + INSERT_CHUNK);
+        let attempt = 0;
+        for (;;) {
+            if (indexAbortRequested) throw indexStopError('abort', inserted);
+            try {
+                await vectorInsert(world, batch);
+                inserted += batch.length;
+                onProgress?.(`${label}: ${inserted}/${items.length} 넣는 중…`);
+                break;
+            } catch (error) {
+                if (error?.indexStop) throw error;
+                attempt++;
+                if (!(Number(error?.status) >= 500)) throw error;
+                if (inserted === 0 && attempt >= 2) throw error;
+                if (retriesUsed >= MAX_RATE_LIMIT_RETRIES) throw indexStopError('limit', inserted);
+                retriesUsed++;
+                if (!(await waitForRateLimit(onProgress, label))) throw indexStopError('abort', inserted);
+            }
+        }
+    }
+    return inserted;
+}
+
+
+/**
+ * 로어북 1개 색인 — v0.20.0부터 **증분이 기본**이다.
+ * content만 임베딩한다 — key(날짜·키워드)는 구분자일 뿐 유사도 대상이 아니다.
+ *
+ * mode:
+ *   'incremental'(기본) — /api/vector/list로 저장된 hash를 읽어 **없는 것만** 넣고, 색인 대상에서
+ *                         빠진 hash는 /api/vector/delete로 치운다(삭제·본문변경·끄기·코어승격 뒷정리).
+ *   'full'              — vectorPurge 후 전량 재삽입. 본문은 같은데 uid가 갈린 뒤처럼 hash 대조로는
+ *                         못 잡는 변경에 쓴다(/list가 hash만 주고 uid를 안 준다).
+ *
+ * 왜 증분이 기본이 됐나: 전량 재삽입은 항목 수만큼 임베딩을 부른다. 제공자 분당 한도에 걸리면 그
+ * 배치가 통째로 죽는데 **이미 purge를 한 뒤**라 기존 색인까지 날아간 반쪽 상태가 되고, 다시 눌러도
+ * 처음부터라 같은 자리에서 또 죽는다(실측 제보: 약 100개 이후 전부 미색인). 증분은 성공한 만큼이
+ * 그대로 남으므로 다시 누르면 이어서 간다.
+ *
+ * @param {string} world 로어북 이름
+ * @param {(text:string)=>void} [onProgress] 진행 콜백
+ * @param {{mode?: 'incremental'|'full', stats?: {added:number, removed:number, kept:number}}} [options]
+ * @returns {Promise<number>} 이 로어북의 색인 대상 항목 수 (0건 처리여도 전체 개수를 돌려준다 — 호출부 문구가 '0개 색인'으로 거짓말하지 않게)
+ */
+export async function indexWorld(world, onProgress, options) {
+    const full = options?.mode === 'full';
+    const stats = options?.stats;
+    const worldData = await loadWorldInfo(world);
+    if (!worldData) {
+        // 못 읽은 북에 purge/delete를 돌리면 멀쩡한 색인을 지운다 — 아무것도 안 하고 빠진다
+        console.warn(`${LOG} '${world}' 로어북을 읽지 못해 색인을 건너뛴다`);
+        return 0;
+    }
+    // constant 항목(코어 메모리)은 색인 제외 — ST 네이티브 매턴 주입이라 검색층에 있으면 이중 주입된다
+    const entries = Object.values(worldData.entries ?? {})
+        .filter(e => !e.disable && !e.constant && String(e.content ?? '').trim());
+
+    // 본문이 똑같은 항목이 둘이면 hash도 같다 → 같은 hash를 두 번 넣지 않는다.
+    // 먼저 만난 항목의 uid를 index로 쓴다(어느 쪽으로 회수되든 본문은 동일하다).
+    const wanted = new Map();
+    for (const e of entries) {
+        const hash = Number(getStringHash(String(e.content)));
+        if (!wanted.has(hash)) {
+            wanted.set(hash, { hash: hash, text: String(e.content), index: Number(e.uid) });
+        }
+    }
+
+    if (full) {
+        await vectorPurge(world);
+        const inserted = await insertInBatches(world, [...wanted.values()], onProgress, world);
+        if (stats) stats.added += inserted;
+        console.log(`${LOG} 전체 재색인 완료: ${world} → ${wanted.size}개 항목, collectionId=${getCollectionId(world)}`);
+        return wanted.size;
+    }
+
+    const stored = await vectorList(world);
+    const toInsert = [...wanted.values()].filter(it => !stored.has(it.hash));
+    const toDelete = [...stored].filter(h => !wanted.has(h));
+    const kept = wanted.size - toInsert.length;
+    if (stats) {
+        stats.added += toInsert.length;
+        stats.removed += toDelete.length;
+        stats.kept += kept;
+    }
+
+    if (!toInsert.length && !toDelete.length) {
+        console.log(`${LOG} '${world}' — 바뀐 게 없어 임베딩 0회 (이미 ${kept}개 색인됨)`);
+        return wanted.size;
+    }
+
+    onProgress?.(`${world}: 새로 ${toInsert.length} · 정리 ${toDelete.length} · 이미 됨 ${kept}`);
+
+    // 지우기 먼저, 넣기 나중 — 중간에 끊겨도 '들어가야 할 게 아직 안 들어간' 상태로만 남는다(다시 누르면 채워진다).
+    await vectorDelete(world, toDelete);
+    const inserted = await insertInBatches(world, toInsert, onProgress, world);
+    console.log(`${LOG} 증분 색인 완료: ${world} → 새로 ${inserted} · 정리 ${toDelete.length} · 이미 됨 ${kept}, collectionId=${getCollectionId(world)}`);
+    return wanted.size;
+}
+
+
+/**
+ * 설정 탭 [색인 (안 된 것만)] / [전체 재색인] 공용 진입점 (v0.20.0).
+ * 돌고 있을 때 다시 누르면 중단 요청이 된다 — 그래서 버튼을 disabled로 묶지 않고 라벨만 [중단]으로 바꾼다.
+ */
+export async function indexLorebook(mode) {
+    if (indexRunning) {
+        requestIndexAbort();
+        return;
+    }
+    const full = mode === 'full';
     const settings = getSettings();
     const worlds = getTargetWorlds();
     if (!worlds.length) {
@@ -998,15 +1159,34 @@ export async function indexLorebook() {
         return;
     }
 
-    const $button = $('#jev_lorebook_index');
-    const $status = $('#jev_lorebook_status');
-    $button.addClass('disabled');
-    $status.text('색인 중…');
+    if (full) {
+        const $confirm = $('<div>').append(
+            $('<p>').text(`로어북 ${worlds.length}개의 색인을 비우고 처음부터 다시 넣어요 — 항목 수만큼 임베딩을 불러요.`),
+            $('<p>').text('중간에 끊기면 [색인 (안 된 것만)]으로 이어갈 수 있어요.'),
+        );
+        const result = await callGenericPopup($confirm, POPUP_TYPE.CONFIRM, '', {
+            okButton: '전체 재색인',
+            cancelButton: '취소',
+        });
+        if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+    }
 
+    const $labels = $('#jev_lorebook_index, #jev_lorebook_reindex_all').find('span');
+    const originals = $labels.map((i, el) => $(el).text()).get();
+    const $status = $('#jev_lorebook_status');
+    indexRunning = true;
+    indexAbortRequested = false;
+    $labels.text(ABORT_LABEL);
+    $status.text(full ? '전체 재색인 중…' : '색인 중…');
+
+    const stats = { added: 0, removed: 0, kept: 0 };
     try {
         let totalItems = 0;
         for (const world of worlds) {
-            totalItems += await indexWorld(world, text => $status.text(text));
+            totalItems += await indexWorld(world, text => $status.text(text), {
+                mode: full ? 'full' : 'incremental',
+                stats: stats,
+            });
         }
 
         if (!totalItems) {
@@ -1015,17 +1195,34 @@ export async function indexLorebook() {
             return;
         }
 
-        $status.text(`색인 완료: ${worlds.length}개 로어북 / ${totalItems}개 항목 (${new Date().toLocaleTimeString()})`);
-        toastr.success(`${totalItems}개 항목 색인을 마쳤어요 — ${worlds.join(', ')}`, DISPLAY_NAME);
-        settings.embeddingDirty = false; // 새 임베딩 설정으로 재색인 완료 — 경고 해제
+        const changes = `새로 ${stats.added} · 정리 ${stats.removed} · 이미 됨 ${stats.kept}`;
+        const at = new Date().toLocaleTimeString();
+        if (!full && !stats.added && !stats.removed) {
+            $status.text(`이미 다 됐어요 — ${totalItems}개 (${at})`);
+            toastr.success(`이미 다 색인돼 있어요 — ${totalItems}개. 임베딩은 한 번도 안 불렀어요.`, DISPLAY_NAME);
+        } else {
+            $status.text(`${full ? '전체 재색인' : '색인'} 완료: ${worlds.length}개 로어북 / ${totalItems}개 항목 · ${changes} (${at})`);
+            toastr.success(`색인을 마쳤어요 — ${changes}`, DISPLAY_NAME);
+        }
+        // 소스·모델을 바꿨어도 해제해도 된다: 벡터 저장 경로가 vectors/<source>/<collection>/<model>이라
+        // (vectors.js getIndex) 바뀐 직후의 증분은 빈 폴더에서 시작해 자연히 전량을 처리한다.
+        settings.embeddingDirty = false;
         saveSettingsDebounced();
         $('#jev_lorebook_reindex_warning').hide();
     } catch (error) {
-        console.error(`${LOG} 색인 실패`, error);
-        toastr.error(`색인에 실패했어요: ${error?.message ?? error}`, DISPLAY_NAME);
-        $status.text('색인에 실패했어요');
+        if (error?.indexStop) {
+            console.warn(`${LOG} 색인 중단(${error.indexStop}) — ${error.inserted}개까지`, error);
+            toastr.info(String(error.message), DISPLAY_NAME);
+            $status.text(String(error.message));
+        } else {
+            console.error(`${LOG} 색인 실패`, error);
+            toastr.error(`색인에 실패했어요: ${error?.message ?? error}`, DISPLAY_NAME);
+            $status.text('색인에 실패했어요');
+        }
     } finally {
-        $button.removeClass('disabled');
+        indexRunning = false;
+        indexAbortRequested = false;
+        $labels.each((i, el) => $(el).text(originals[i]));
     }
 }
 

@@ -38,6 +38,8 @@ import {
 } from './src/core.js';
 import {
     indexLorebook,
+    requestIndexAbort,
+    isIndexing,
     populateEmbeddingSourceSelect,
     populateWorldSelect,
     renderDetectionSummary,
@@ -64,6 +66,8 @@ registerHooks({
     indexWorld,
     onEntryDemoted: vectorInsert,   // 코어 → 검색층 강등 시 그 항목만 단건 삽입 (임베딩 1회)
     vectorList,
+    abortIndexing: requestIndexAbort,  // 패널 [중단] — core는 jev를 직접 import할 수 없다 (v0.20.0)
+    isIndexing,
     budgetTokens: getBudgetTokens,
     renderPanelJudgment,
     summaryRows: renderSummaryJevRows,
@@ -108,7 +112,10 @@ jQuery(async () => {
     // 켜기 / Jev 키 / 임베딩(소스·키 상태·전용키 모드·모델·재색인 경고) / [색인] / 상태줄 / 감지 요약 / 팝업 버튼 2개.
     // 나머지 입력칸은 팝업 A(주입 세부)·B(로어북 만들기)로 내렸다 — 탭에 20칸 넘게 늘어놓으면 쓸 수 없다는 게 발주 사유다.
 
-    $('#jev_lorebook_index').on('click', indexLorebook);
+    // v0.20.0 — 버튼 둘. 기본은 증분(안 된 것만), 전체 재색인은 purge 후 전량이라 확인 팝업이 붙는다.
+    // 돌고 있을 때 다시 누르면 중단 요청이 된다(indexLorebook 안에서 분기) — 그래서 disabled로 묶지 않는다.
+    $('#jev_lorebook_index').on('click', () => void indexLorebook('incremental'));
+    $('#jev_lorebook_reindex_all').on('click', () => void indexLorebook('full'));
 
     // 임베딩 소스/모델 (v0.5) — 변경 시 기존 색인과 벡터 차원이 어긋나므로 재색인 경고
     populateEmbeddingSourceSelect();
@@ -208,5 +215,5 @@ jQuery(async () => {
     $wandItem.find('span').text(DISPLAY_NAME);
     $wandItem.on('click', openDetailPanel);
 
-    console.log(`${LOG} 로드 완료 v0.19.1 — flavor=jev, core=src/core.js`);
+    console.log(`${LOG} 로드 완료 v0.20.0 — flavor=jev, core=src/core.js`);
 });

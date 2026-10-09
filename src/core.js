@@ -32,12 +32,18 @@ import { hooks } from './hooks.js';
 // 옮겨온 함수 본문을 한 줄도 고치지 않았다(리팩터 = 이동, 재작성 아님).
 // 훅이 없는 배포본(논제브)에서는 임베딩·벡터 호출이 0회가 되도록 안전한 기본값으로 착지한다.
 export const EMPTY_KEY_SET = new Set();
-export const indexWorld = (world, onProgress) => hooks.indexWorld ? hooks.indexWorld(world, onProgress) : Promise.resolve(0);
+// v0.20.0 — 세 번째 인자(옵션 객체)를 통과시킨다. 기본은 증분이고 `{ mode: 'full' }`일 때만 purge 후 전량 재삽입이다.
+// core.js 안에서 full이 필요한 자리는 아래 두 곳뿐이다(스플릿·되돌리기): /api/vector/list가 hash만 주고
+// uid를 안 줘서, 본문이 같은데 uid만 갈린 변경을 증분이 못 잡는다. 훅 미등록 배포본에는 영향이 없다.
+export const indexWorld = (world, onProgress, options) => hooks.indexWorld ? hooks.indexWorld(world, onProgress, options) : Promise.resolve(0);
 export const vectorInsert = (world, items) => hooks.onEntryDemoted ? hooks.onEntryDemoted(world, items) : Promise.resolve(null);
 export const vectorList = (world) => hooks.vectorList ? hooks.vectorList(world) : Promise.resolve(null);
 export const getBudgetTokens = (world, layer) => hooks.budgetTokens ? hooks.budgetTokens(world, layer) : 0;
 export const renderPanelJudgment = ($box, rejected) => hooks.renderPanelJudgment?.($box, rejected);
 export const openInjectionSettingsPopup = () => hooks.openInjectionSettings?.();
+// 색인 중단 창구 (v0.20.0) — 패널 버튼이 돌고 있는 색인을 멈추게 한다. 훅이 없으면 색인 기능 자체가 없는 배포본이다.
+export const abortIndexing = () => hooks.abortIndexing?.();
+export const isIndexing = () => (hooks.isIndexing ? hooks.isIndexing() : false);
 
 // ── 항목 키 정제 (v0.19.0) ───────────────────────────────────────────────
 // 변환 파서는 v0.6.0부터 모델의 `Keywords:` 줄을 읽어 **버리고** 있었다(배관은 살아 있었다).
@@ -1934,7 +1940,8 @@ export async function runSplitForWorld(world, uids, setStatus) {
     await saveWorldInfo(world, worldData, true);
     reloadEditor(world); // 에디터 실시간 갱신 (열려 있을 때만)
     setStatus('재색인 중…');
-    const indexed = await indexWorld(world, setStatus);
+    // 통짜 항목이 덩어리로 갈리면서 uid가 전부 새로 붙는다 — hash 대조로는 못 잡는 변경이라 전체 재색인이다.
+    const indexed = await indexWorld(world, setStatus, { mode: 'full' });
 
     console.log(`${LOG} 스플릿 완료 — '${world}' ${entriesSplit}항목 → ${chunksCreated}덩어리 / 색인 ${indexed} / 백업 '${backupName}'`);
     return { entriesSplit, chunksCreated, backupName, indexed };
@@ -2139,7 +2146,8 @@ export async function undoLastConversion(setStatus) {
     }
 
     setStatus('재색인 중…');
-    const indexed = await indexWorld(snap.world, setStatus);
+    // 되돌리기는 항목을 지우고 코어를 통째로 복원한다 — 증분이 못 보는 uid 변동이 섞일 수 있어 전체 재색인이다.
+    const indexed = await indexWorld(snap.world, setStatus, { mode: 'full' });
     lastConvertWarnings = [];
     console.log(`${LOG} 되돌리기 완료 — 항목 ${removed}개 삭제 / ${rulesNote} / ${diaryNote} / 메시지 ${unhidden}개 복구 / ${indexed}개 재색인`);
     return { removed, rulesNote, diaryNote, unhidden, indexed };
@@ -2705,27 +2713,41 @@ export async function openDetailPanel() {
         }
     });
 
+    // v0.20.0 — 패널 버튼은 **증분**이다. 채팅 중 동선에서 purge를 돌리면 끊겼을 때 기존 색인까지
+    // 날아간다(그게 고치려던 버그다). 파괴적인 [전체 재색인]은 설정 탭 한 곳에만 둔다.
+    // 돌고 있을 때 다시 누르면 중단 요청 — 그래서 disabled로 묶지 않고 라벨만 바꾼다.
     $panel.find('#jev_panel_reindex').on('click', async function () {
-        const $button = $(this);
-        if ($button.hasClass('disabled')) return;
-        const worlds = getTargetWorlds();
-        if (!worlds.length) {
-            toastr.warning('색인 대상이 없다.', DISPLAY_NAME);
+        const $label = $(this).find('span');
+        if (isIndexing()) {
+            abortIndexing();
             return;
         }
-        $button.addClass('disabled');
+        const worlds = getTargetWorlds();
+        if (!worlds.length) {
+            toastr.warning('색인할 대상이 없어요.', DISPLAY_NAME);
+            return;
+        }
+        const original = $label.text();
+        $label.text('중단');
         try {
             let total = 0;
             for (const world of worlds) {
                 total += await indexWorld(world, setConvertStatus);
             }
-            setConvertStatus(`재색인 완료: ${worlds.length}개 로어북 / ${total}개 항목`);
+            setConvertStatus(`색인 완료: ${worlds.length}개 로어북 / ${total}개 항목`);
             await renderPanelChunks($panel);
         } catch (error) {
-            setConvertStatus(`재색인 실패: ${error?.message ?? error}`);
-            toastr.error(`재색인 실패: ${error?.message ?? error}`, DISPLAY_NAME);
+            // 중단·한도초과는 '여기까지 됐다'라 빨간 에러로 쓰지 않는다 — 넣은 것은 남아 있다.
+            if (error?.indexStop) {
+                setConvertStatus(String(error.message));
+                toastr.info(String(error.message), DISPLAY_NAME);
+                await renderPanelChunks($panel);
+            } else {
+                setConvertStatus(`색인 실패: ${error?.message ?? error}`);
+                toastr.error(`색인 실패: ${error?.message ?? error}`, DISPLAY_NAME);
+            }
         } finally {
-            $button.removeClass('disabled');
+            $label.text(original);
         }
     });
 

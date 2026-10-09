@@ -50,12 +50,17 @@
             <small class="jev-set-help">비우면 기본 모델. 바꾸면 [색인] 다시.</small>
             <small id="jev_lorebook_reindex_warning" class="jev-reindex-warning" style="display: none;">⚠ 임베딩 설정이 바뀌어 재색인이 필요해요 — [색인]을 눌러 주세요.</small>
 
-            <div id="jev_lorebook_index" class="menu_button menu_button_icon" title="대상 로어북(자동 감지 또는 고정)의 활성 항목을 벡터로 색인해요">
-                <i class="fa-solid fa-database"></i>
-                <span>색인</span>
+            <div class="jev-set-buttons">
+                <div id="jev_lorebook_index" class="menu_button menu_button_icon" title="아직 색인 안 된 항목만 넣고, 빠진 항목은 색인에서 치워요. 중간에 끊겨도 다시 누르면 이어서 해요">
+                    <i class="fa-solid fa-database"></i>
+                    <span>색인 (안 된 것만)</span>
+                </div>
+                <div id="jev_lorebook_reindex_all" class="menu_button menu_button_icon" title="색인을 비우고 처음부터 다시 넣어요 — 항목 수만큼 임베딩을 불러요">
+                    <i class="fa-solid fa-rotate"></i>
+                    <span>전체 재색인</span>
+                </div>
             </div>
-            <small class="jev-set-help">첫 설치 시 로어북을 연결한 뒤 눌러 주세요.</small>
-
+            <small class="jev-set-help">첫 설치 시 로어북을 연결한 뒤 [색인]을 눌러 주세요.</small>
             <small id="jev_lorebook_status" class="jev-lorebook-status"></small>
 
             <div class="jev-set-group">감지된 로어북</div>
