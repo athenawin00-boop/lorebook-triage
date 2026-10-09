@@ -2713,11 +2713,10 @@ export async function openDetailPanel() {
         }
     });
 
-    // v0.20.0 — 패널 버튼은 **증분**이다. 채팅 중 동선에서 purge를 돌리면 끊겼을 때 기존 색인까지
-    // 날아간다(그게 고치려던 버그다). 파괴적인 [전체 재색인]은 설정 탭 한 곳에만 둔다.
-    // 돌고 있을 때 다시 누르면 중단 요청 — 그래서 disabled로 묶지 않고 라벨만 바꾼다.
-    $panel.find('#jev_panel_reindex').on('click', async function () {
-        const $label = $(this).find('span');
+    // v0.20.0 — 패널 색인 버튼 둘: 증분(기본) / 전체(purge 후 전량 — 확인 팝업을 거친다).
+    // 전체는 끊기면 기존 색인까지 비어 있으므로 팝업에 '증분으로 이어가기'를 안내한다.
+    // 돌고 있을 때 어느 쪽이든 다시 누르면 중단 요청 — 그래서 disabled로 묶지 않고 라벨만 바꾼다.
+    const runPanelIndex = async (mode) => {
         if (isIndexing()) {
             abortIndexing();
             return;
@@ -2727,14 +2726,27 @@ export async function openDetailPanel() {
             toastr.warning('색인할 대상이 없어요.', DISPLAY_NAME);
             return;
         }
-        const original = $label.text();
-        $label.text('중단');
+        const full = mode === 'full';
+        if (full) {
+            const $confirm = $('<div>').append(
+                $('<p>').text(`로어북 ${worlds.length}개의 색인을 비우고 처음부터 다시 넣어요 — 항목 수만큼 임베딩을 불러요.`),
+                $('<p>').text('중간에 끊기면 [색인 (안 된 것만)]으로 이어갈 수 있어요.'),
+            );
+            const result = await callGenericPopup($confirm, POPUP_TYPE.CONFIRM, '', {
+                okButton: '전체 재색인',
+                cancelButton: '취소',
+            });
+            if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+        }
+        const $labels = $panel.find('#jev_panel_reindex, #jev_panel_reindex_all').find('span');
+        const originals = $labels.map((i, el) => $(el).text()).get();
+        $labels.text('중단');
         try {
             let total = 0;
             for (const world of worlds) {
-                total += await indexWorld(world, setConvertStatus);
+                total += await indexWorld(world, setConvertStatus, { mode: full ? 'full' : 'incremental' });
             }
-            setConvertStatus(`색인 완료: ${worlds.length}개 로어북 / ${total}개 항목`);
+            setConvertStatus(`${full ? '전체 재색인' : '색인'} 완료: ${worlds.length}개 로어북 / ${total}개 항목`);
             await renderPanelChunks($panel);
         } catch (error) {
             // 중단·한도초과는 '여기까지 됐다'라 빨간 에러로 쓰지 않는다 — 넣은 것은 남아 있다.
@@ -2747,9 +2759,11 @@ export async function openDetailPanel() {
                 toastr.error(`색인 실패: ${error?.message ?? error}`, DISPLAY_NAME);
             }
         } finally {
-            $label.text(original);
+            $labels.each((i, el) => { $(el).text(originals[i]); });
         }
-    });
+    };
+    $panel.find('#jev_panel_reindex').on('click', () => void runPanelIndex('incremental'));
+    $panel.find('#jev_panel_reindex_all').on('click', () => void runPanelIndex('full'));
 
     $panel.find('#jev_panel_split').on('click', async function () {
         const $button = $(this);
